@@ -17,6 +17,10 @@ const WINDOW_APPEAR_TIMEOUT: Duration = Duration::from_secs(15);
 /// after the main restore loop finishes.
 const LATE_WINDOW_GRACE_PERIOD: Duration = Duration::from_secs(60);
 
+/// How long to wait, after a launched app's first window appears, for a
+/// second window of the same class to show up (splash-window supersede).
+const RETILE_GRACE_PERIOD: Duration = Duration::from_millis(800);
+
 /// Known terminal working-directory flags, keyed by binary name.
 /// Known terminal working-directory flags, keyed by binary name.
 const TERMINAL_CWD_FLAGS: &[(&str, &str)] = &[
@@ -534,16 +538,21 @@ impl RestoreEngine {
                     step.preselect,
                 );
 
-                if let (Some(focus_idx), Some(presel)) = (step.focus_idx, step.preselect)
-                    && let Some(focus_addr) = addresses.get(&focus_idx)
-                {
-                    ctl.dispatch(&format!("focuswindow address:0x{focus_addr}"))
-                        .await?;
-                    ctl.dispatch(&format!("layoutmsg preselect {presel}"))
-                        .await?;
-                } else if i == 0 {
-                    ctl.dispatch(&format!("workspace {ws}")).await?;
-                }
+                let anchor: Option<(&str, dwindle::PreselDir)> =
+                    if let (Some(focus_idx), Some(presel)) = (step.focus_idx, step.preselect)
+                        && let Some(focus_addr) = addresses.get(&focus_idx)
+                    {
+                        ctl.dispatch(&format!("focuswindow address:0x{focus_addr}"))
+                            .await?;
+                        ctl.dispatch(&format!("layoutmsg preselect {presel}"))
+                            .await?;
+                        Some((focus_addr.as_str(), presel))
+                    } else {
+                        if i == 0 {
+                            ctl.dispatch(&format!("workspace {ws}")).await?;
+                        }
+                        None
+                    };
 
                 match self
                     .bsp_launch_and_track(
@@ -553,6 +562,7 @@ impl RestoreEngine {
                         active_rules,
                         pending,
                         &mut rule_counter,
+                        anchor,
                     )
                     .await
                 {
@@ -585,6 +595,7 @@ impl RestoreEngine {
     /// The rule is disabled immediately once the window appears so that a
     /// subsequent window of the same class never sees a stale rule. Only
     /// rules for timed-out windows are kept alive for the background watcher.
+    #[allow(clippy::too_many_arguments)]
     async fn bsp_launch_and_track(
         &self,
         window: &WindowEntry,
@@ -593,6 +604,7 @@ impl RestoreEngine {
         active_rules: &mut Vec<String>,
         pending: &mut Vec<PendingWindow>,
         rule_counter: &mut usize,
+        anchor: Option<(&str, dwindle::PreselDir)>,
     ) -> Result<Option<String>> {
         let rule_name = format!(
             "hyprresume-{}-{}",
@@ -626,7 +638,10 @@ impl RestoreEngine {
                 ))
                 .await,
             );
-            Ok(Some(addr.clone()))
+            let final_addr = self
+                .retile_superseding_window(ctl, events, addr, &window.app_id, anchor)
+                .await;
+            Ok(Some(final_addr))
         } else {
             tracing::warn!(
                 "{} did not appear within {}s, deferring to late-window watcher",
@@ -645,6 +660,91 @@ impl RestoreEngine {
             });
             Ok(None)
         }
+    }
+
+    /// After a launched app's first window appears, wait briefly to see if a
+    /// second window of the same class shows up too — some apps (observed:
+    /// Discord) open a transient splash window before their real main
+    /// window, both sharing the same class. If a second window appears, the
+    /// first is a stale splash: its address may already have been used as a
+    /// focus anchor for a sibling window's preselect step, silently
+    /// misplacing it in the BSP tree once the splash closes. Close the
+    /// stale window and redo the correct placement dance against the real
+    /// one: focus the original anchor, re-issue preselect, focus the real
+    /// window, float it out, then settle it back in (Hyprland places a
+    /// window that transitions floating->tiled at the current preselect
+    /// slot, same as a brand-new window).
+    ///
+    /// Returns the address that should be tracked as this window's final
+    /// address — either `first_addr` unchanged if no second window showed
+    /// up, or the real window's address.
+    async fn retile_superseding_window(
+        &self,
+        ctl: &HyprCtl,
+        events: &mut mpsc::Receiver<HyprEvent>,
+        first_addr: &str,
+        class: &str,
+        anchor: Option<(&str, dwindle::PreselDir)>,
+    ) -> String {
+        let Some(real_addr) = self
+            .wait_for_open_event_within(events, class, RETILE_GRACE_PERIOD)
+            .await
+        else {
+            return first_addr.to_string();
+        };
+
+        tracing::info!(
+            "retile: {class} splash (0x{first_addr}) superseded by real window (0x{real_addr})"
+        );
+
+        if ctl
+            .dispatch(&format!("closewindow address:0x{first_addr}"))
+            .await
+            .is_ok()
+        {
+            tracing::debug!("retile: close stale ok");
+        }
+
+        if let Some((anchor_addr, presel)) = anchor {
+            if ctl
+                .dispatch(&format!("focuswindow address:0x{anchor_addr}"))
+                .await
+                .is_ok()
+            {
+                tracing::debug!("retile: focus anchor ok");
+            }
+            if ctl
+                .dispatch(&format!("layoutmsg preselect {presel}"))
+                .await
+                .is_ok()
+            {
+                tracing::debug!("retile: preselect ok");
+            }
+        }
+
+        if ctl
+            .dispatch(&format!("focuswindow address:0x{real_addr}"))
+            .await
+            .is_ok()
+        {
+            tracing::debug!("retile: focus real ok");
+        }
+        if ctl
+            .dispatch(&format!("setfloating address:0x{real_addr}"))
+            .await
+            .is_ok()
+        {
+            tracing::debug!("retile: float ok");
+        }
+        if ctl
+            .dispatch(&format!("setfloating address:0x{real_addr}"))
+            .await
+            .is_ok()
+        {
+            tracing::debug!("retile: settile ok");
+        }
+
+        real_addr
     }
 
     /// Apply `layoutmsg splitratio <delta>` for each split node in the BSP tree
@@ -907,7 +1007,17 @@ impl RestoreEngine {
         events: &mut mpsc::Receiver<HyprEvent>,
         app_id: &str,
     ) -> Option<String> {
-        tokio::time::timeout(WINDOW_APPEAR_TIMEOUT, async {
+        self.wait_for_open_event_within(events, app_id, WINDOW_APPEAR_TIMEOUT)
+            .await
+    }
+
+    async fn wait_for_open_event_within(
+        &self,
+        events: &mut mpsc::Receiver<HyprEvent>,
+        app_id: &str,
+        timeout: Duration,
+    ) -> Option<String> {
+        tokio::time::timeout(timeout, async {
             while let Some(event) = events.recv().await {
                 if let HyprEvent::OpenWindow { address, class, .. } = event
                     && class == app_id
@@ -1574,5 +1684,107 @@ mod tests {
 
         s1.abort();
         s2.abort();
+    }
+
+    /// When only one window of the class ever appears (no splash), the
+    /// grace period expires with nothing new and the original address is
+    /// returned unchanged with no extra dispatch calls.
+    #[tokio::test]
+    async fn retile_no_supersede_returns_original_address() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock1 = dir.path().join("s1.sock");
+        let sock2 = dir.path().join("s2.sock");
+
+        let (mock1, log) = RecordingSocket1::new(&sock1);
+        let s1 = tokio::spawn(mock1.serve());
+
+        let ctl = HyprCtl::new(HyprSocketPaths::new(sock1, sock2));
+        let engine = RestoreEngine::new(true, true);
+        let (_tx, mut rx) = mpsc::channel::<HyprEvent>(8);
+
+        let result = engine
+            .retile_superseding_window(&ctl, &mut rx, "aaa000", "discord", None)
+            .await;
+
+        assert_eq!(result, "aaa000");
+        let commands = log.lock().await;
+        assert!(
+            commands.is_empty(),
+            "no dispatch should happen when no supersede occurs, got: {commands:?}"
+        );
+        drop(commands);
+
+        s1.abort();
+    }
+
+    /// When a second window of the same class appears within the grace
+    /// period, the stale first window is closed and the anchor/preselect/
+    /// focus/float/settle dance is redone against the real window.
+    #[tokio::test]
+    async fn retile_supersede_redoes_placement() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock1 = dir.path().join("s1.sock");
+        let sock2 = dir.path().join("s2.sock");
+
+        let (mock1, log) = RecordingSocket1::new(&sock1);
+        let s1 = tokio::spawn(mock1.serve());
+
+        let ctl = HyprCtl::new(HyprSocketPaths::new(sock1, sock2));
+        let engine = RestoreEngine::new(true, true);
+        let (tx, mut rx) = mpsc::channel::<HyprEvent>(8);
+        tx.send(HyprEvent::OpenWindow {
+            address: "bbb111".to_string(),
+            workspace: "4".to_string(),
+            class: "discord".to_string(),
+        })
+        .await
+        .unwrap();
+
+        let result = engine
+            .retile_superseding_window(
+                &ctl,
+                &mut rx,
+                "aaa000",
+                "discord",
+                Some(("anchor123", dwindle::PreselDir::Bottom)),
+            )
+            .await;
+
+        assert_eq!(result, "bbb111");
+
+        let commands = log.lock().await;
+        assert!(
+            commands
+                .iter()
+                .any(|c| c.contains("closewindow address:0xaaa000")),
+            "expected close of stale splash, got: {commands:?}"
+        );
+        assert!(
+            commands
+                .iter()
+                .any(|c| c.contains("focuswindow address:0xanchor123")),
+            "expected focus anchor, got: {commands:?}"
+        );
+        assert!(
+            commands.iter().any(|c| c.contains("layoutmsg preselect b")),
+            "expected preselect, got: {commands:?}"
+        );
+        assert!(
+            commands
+                .iter()
+                .any(|c| c.contains("focuswindow address:0xbbb111")),
+            "expected focus real window, got: {commands:?}"
+        );
+        let float_count = commands
+            .iter()
+            .filter(|c| c.contains("setfloating address:0xbbb111"))
+            .count();
+        assert_eq!(
+            float_count, 2,
+            "expected float + settile (2x setfloating), got: {commands:?}"
+        );
+        drop(commands);
+
+        s1.abort();
     }
 }
