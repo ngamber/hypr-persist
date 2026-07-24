@@ -734,7 +734,14 @@ impl RestoreEngine {
                 .await,
             );
             let final_addr = self
-                .retile_superseding_window(ctl, events, addr, &window.app_id, anchor)
+                .retile_superseding_window(
+                    ctl,
+                    events,
+                    addr,
+                    &window.app_id,
+                    &window.workspace,
+                    anchor,
+                )
                 .await;
             Ok(Some(final_addr))
         } else {
@@ -765,7 +772,11 @@ impl RestoreEngine {
     /// focus anchor for a sibling window's preselect step, silently
     /// misplacing it in the BSP tree once the splash closes. Close the
     /// stale window and redo the correct placement dance against the real
-    /// one: focus the original anchor, re-issue preselect, focus the real
+    /// one: move it to the target workspace (the window rule that would
+    /// normally do this was already disabled once the splash appeared, so
+    /// the real window otherwise opens wherever Hyprland defaults to — the
+    /// currently active workspace, which is not necessarily the target one),
+    /// focus the original anchor, re-issue preselect, focus the real
     /// window, float it out, then settle it back in (Hyprland places a
     /// window that transitions floating->tiled at the current preselect
     /// slot, same as a brand-new window).
@@ -779,6 +790,7 @@ impl RestoreEngine {
         events: &mut mpsc::Receiver<HyprEvent>,
         first_addr: &str,
         class: &str,
+        workspace: &str,
         anchor: Option<(&str, dwindle::PreselDir)>,
     ) -> String {
         let Some(real_addr) = self
@@ -798,6 +810,16 @@ impl RestoreEngine {
             .is_ok()
         {
             tracing::debug!("retile: close stale ok");
+        }
+
+        if ctl
+            .dispatch(&format!(
+                "movetoworkspacesilent {workspace},address:0x{real_addr}"
+            ))
+            .await
+            .is_ok()
+        {
+            tracing::debug!("retile: move to workspace ok");
         }
 
         if let Some((anchor_addr, presel)) = anchor {
@@ -1848,7 +1870,7 @@ mod tests {
         let (_tx, mut rx) = mpsc::channel::<HyprEvent>(8);
 
         let result = engine
-            .retile_superseding_window(&ctl, &mut rx, "aaa000", "discord", None)
+            .retile_superseding_window(&ctl, &mut rx, "aaa000", "discord", "4", None)
             .await;
 
         assert_eq!(result, "aaa000");
@@ -1891,6 +1913,7 @@ mod tests {
                 &mut rx,
                 "aaa000",
                 "discord",
+                "4",
                 Some(("anchor123", dwindle::PreselDir::Bottom)),
             )
             .await;
@@ -1903,6 +1926,12 @@ mod tests {
                 .iter()
                 .any(|c| c.contains("closewindow address:0xaaa000")),
             "expected close of stale splash, got: {commands:?}"
+        );
+        assert!(
+            commands
+                .iter()
+                .any(|c| c.contains("movetoworkspacesilent 4,address:0xbbb111")),
+            "expected move of the real window to the target workspace, got: {commands:?}"
         );
         assert!(
             commands
