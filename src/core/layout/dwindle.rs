@@ -564,4 +564,84 @@ mod tests {
         );
         assert_eq!(plan.unwrap().steps.len(), 4);
     }
+
+    /// Real-world 2x2 grid geometry (zen3bot workspace 4: two Alacritty
+    /// terminals stacked in a left column, discord+slack stacked in a right
+    /// column), array order [a0(top), a1(bottom), discord, slack] with
+    /// global indices [0, 1, 2, 3].
+    ///
+    ///  +--------------+------------+
+    ///  |    a0(top)   |  discord   |
+    ///  +--------------+------------+
+    ///  |  a1(bottom)  |   slack    |
+    ///  +--------------+------------+
+    #[test]
+    fn real_world_four_window_2x2_grid() {
+        let a0 = make_entry("Alacritty", "4", 2570, 45, 1464, 602);
+        let a1 = make_entry("Alacritty", "4", 2570, 657, 1464, 773);
+        let discord = make_entry("discord", "4", 4044, 45, 1066, 688);
+        let slack = make_entry("slack", "4", 4044, 743, 1066, 687);
+        let refs: Vec<&WindowEntry> = vec![&a0, &a1, &discord, &slack];
+
+        let plan = build_workspace_plan(&refs, &[0, 1, 2, 3])
+            .expect("BSP inference should succeed for a clean 2x2 grid");
+        assert_eq!(plan.steps.len(), 4);
+
+        // Root split is horizontal (left column vs. right column): a0 opens
+        // first with no anchor, then discord splits off to its right.
+        assert_eq!(plan.steps[0].window_idx, 0, "a0 opens first, no anchor");
+        assert_eq!(plan.steps[0].focus_idx, None);
+        assert!(plan.steps[0].preselect.is_none());
+
+        assert_eq!(plan.steps[1].window_idx, 2, "discord splits off a0");
+        assert_eq!(plan.steps[1].focus_idx, Some(0));
+        assert!(matches!(plan.steps[1].preselect, Some(PreselDir::Right)));
+
+        // Left column fills in: a1 splits below a0.
+        assert_eq!(plan.steps[2].window_idx, 1, "a1 splits below a0");
+        assert_eq!(plan.steps[2].focus_idx, Some(0));
+        assert!(matches!(plan.steps[2].preselect, Some(PreselDir::Bottom)));
+
+        // Right column fills in: slack splits below discord.
+        assert_eq!(plan.steps[3].window_idx, 3, "slack splits below discord");
+        assert_eq!(plan.steps[3].focus_idx, Some(2));
+        assert!(matches!(plan.steps[3].preselect, Some(PreselDir::Bottom)));
+    }
+
+    /// Same 2x2 grid geometry as `real_world_four_window_2x2_grid`, but
+    /// using the array order actually found in a live `last.toml` session
+    /// file (slack, discord, then the two Alacrittys) with global indices
+    /// [0, 1, 2, 3] mapping to [slack, discord, a1, a0]. BSP inference is
+    /// purely geometric (`split_candidates` sorts/dedups edge coordinates
+    /// independent of input order), so the tree *shape* should be identical
+    /// to the other ordering — only the global-index numbers attached to
+    /// each leaf differ, following the remapping.
+    #[test]
+    fn real_world_four_window_2x2_grid_matches_live_session_order() {
+        let slack = make_entry("slack", "4", 4044, 743, 1066, 687);
+        let discord = make_entry("discord", "4", 4044, 45, 1066, 688);
+        let a1 = make_entry("Alacritty", "4", 2570, 657, 1464, 773);
+        let a0 = make_entry("Alacritty", "4", 2570, 45, 1464, 602);
+        let refs: Vec<&WindowEntry> = vec![&slack, &discord, &a1, &a0];
+        // global indices: slack=0, discord=1, a1=2, a0=3
+        let plan = build_workspace_plan(&refs, &[0, 1, 2, 3])
+            .expect("BSP inference should succeed regardless of array order");
+        assert_eq!(plan.steps.len(), 4);
+
+        assert_eq!(plan.steps[0].window_idx, 3, "a0 opens first, no anchor");
+        assert_eq!(plan.steps[0].focus_idx, None);
+        assert!(plan.steps[0].preselect.is_none());
+
+        assert_eq!(plan.steps[1].window_idx, 1, "discord splits off a0");
+        assert_eq!(plan.steps[1].focus_idx, Some(3));
+        assert!(matches!(plan.steps[1].preselect, Some(PreselDir::Right)));
+
+        assert_eq!(plan.steps[2].window_idx, 2, "a1 splits below a0");
+        assert_eq!(plan.steps[2].focus_idx, Some(3));
+        assert!(matches!(plan.steps[2].preselect, Some(PreselDir::Bottom)));
+
+        assert_eq!(plan.steps[3].window_idx, 0, "slack splits below discord");
+        assert_eq!(plan.steps[3].focus_idx, Some(1));
+        assert!(matches!(plan.steps[3].preselect, Some(PreselDir::Bottom)));
+    }
 }
