@@ -11,7 +11,7 @@ pub struct StateManager {
     include_patterns: Vec<Regex>,
 }
 
-fn normalize_address(addr: &str) -> String {
+pub(crate) fn normalize_address(addr: &str) -> String {
     addr.trim_start_matches("0x").to_lowercase()
 }
 

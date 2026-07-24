@@ -36,11 +36,13 @@ pub async fn run(config: Config) -> Result<()> {
         tracing::info!("restoring previous session...");
         match snapshot.load("last") {
             Ok(session) => {
+                let live_windows: Vec<crate::models::TrackedWindow> =
+                    state.lock().await.windows().into_iter().cloned().collect();
                 let engine = RestoreEngine::new(
                     config.general.restore_geometry,
                     config.general.restore_layout,
                 );
-                let (report, _watcher) = engine.restore(&session, &ctl).await?;
+                let (report, _watcher) = engine.restore(&session, &ctl, live_windows).await?;
                 if report.failed > 0 {
                     for (app, err) in &report.errors {
                         tracing::warn!("restore failed for {app}: {err}");
