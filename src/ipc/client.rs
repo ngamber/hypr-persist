@@ -1,11 +1,24 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use anyhow::{Context, Result};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 
+use crate::ipc::lua_compat;
 use crate::models::{HyprClient, HyprMonitor};
+
+const DISPATCH_MODE_UNKNOWN: u8 = 0;
+const DISPATCH_MODE_CLASSIC: u8 = 1;
+const DISPATCH_MODE_LUA: u8 = 2;
+
+/// A Lua-config Hyprland instance evaluates `dispatch <args>` as
+/// `return hl.dispatch(<args>)`, so a classic dispatcher string fails Lua
+/// parsing with an error like this.
+fn looks_like_lua_rejection(resp: &str) -> bool {
+    resp.contains("hl.dispatch") || resp.contains("dispatch in lua is a shorthand")
+}
 
 /// Resolved Hyprland socket paths for a running instance.
 #[derive(Debug, Clone)]
@@ -46,16 +59,21 @@ async fn send_recv(socket_path: &Path, request: &str) -> Result<String> {
 /// Single IPC handle to a Hyprland instance. Create once, pass by reference.
 pub struct HyprCtl {
     paths: HyprSocketPaths,
+    dispatch_mode: AtomicU8,
 }
 
 impl HyprCtl {
     pub const fn new(paths: HyprSocketPaths) -> Self {
-        Self { paths }
+        Self {
+            paths,
+            dispatch_mode: AtomicU8::new(DISPATCH_MODE_UNKNOWN),
+        }
     }
 
     pub fn from_env() -> Result<Self> {
         Ok(Self {
             paths: HyprSocketPaths::from_env()?,
+            dispatch_mode: AtomicU8::new(DISPATCH_MODE_UNKNOWN),
         })
     }
 
@@ -84,12 +102,45 @@ impl HyprCtl {
             .find(|c| c.address.trim_start_matches("0x") == normalized))
     }
 
+    /// Issue a classic-syntax dispatch. On a Lua-config Hyprland instance
+    /// (where `dispatch <args>` is evaluated as Lua and rejects classic
+    /// strings outright), transparently translates via [`lua_compat`] and
+    /// retries. The detected mode is cached after the first call.
     pub async fn dispatch(&self, args: &str) -> Result<String> {
-        self.plain(&format!("dispatch {args}")).await
+        match self.dispatch_mode.load(Ordering::Relaxed) {
+            DISPATCH_MODE_LUA => {
+                let translated = lua_compat::translate_dispatch(args)?;
+                self.plain(&format!("dispatch {translated}")).await
+            }
+            DISPATCH_MODE_CLASSIC => self.plain(&format!("dispatch {args}")).await,
+            _ => {
+                let resp = self.plain(&format!("dispatch {args}")).await?;
+                if looks_like_lua_rejection(&resp) {
+                    self.dispatch_mode
+                        .store(DISPATCH_MODE_LUA, Ordering::Relaxed);
+                    let translated = lua_compat::translate_dispatch(args)?;
+                    self.plain(&format!("dispatch {translated}")).await
+                } else {
+                    self.dispatch_mode
+                        .store(DISPATCH_MODE_CLASSIC, Ordering::Relaxed);
+                    Ok(resp)
+                }
+            }
+        }
     }
 
+    /// Issue a classic-syntax `keyword` (config-value set). Translation for
+    /// Lua-config instances is not yet confirmed/implemented — a rejection is
+    /// logged so it's diagnosable via journalctl rather than silently eaten.
     pub async fn keyword(&self, args: &str) -> Result<String> {
-        self.plain(&format!("keyword {args}")).await
+        let resp = self.plain(&format!("keyword {args}")).await?;
+        if looks_like_lua_rejection(&resp) {
+            tracing::warn!(
+                "lua_compat: keyword {args:?} was rejected by a Lua-config Hyprland \
+                 instance and translation isn't implemented yet: {resp}"
+            );
+        }
+        Ok(resp)
     }
 
     pub async fn get_monitors(&self) -> Result<Vec<HyprMonitor>> {
