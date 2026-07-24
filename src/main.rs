@@ -177,7 +177,9 @@ async fn cmd_restore(cfg: &config::Config, name: Option<&str>) -> Result<()> {
     let session = snapshot.load(name)?;
     let engine =
         core::restore::RestoreEngine::new(cfg.general.restore_geometry, cfg.general.restore_layout);
-    let (report, watcher) = engine.restore(&session, &ctl).await?;
+    // No live-window inventory here: this is a one-shot manual restore with
+    // no daemon-tracked state, unlike the daemon's restore-on-start path.
+    let (report, watcher) = engine.restore(&session, &ctl, Vec::new()).await?;
 
     println!(
         "Restored {}/{} apps{}",

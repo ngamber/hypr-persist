@@ -7,9 +7,10 @@ use tokio::task::JoinHandle;
 
 use crate::core::layout::dwindle::{self, DwindlePlan};
 use crate::core::layout::master::{self, MasterPlan};
+use crate::core::state::normalize_address;
 use crate::ipc::client::HyprCtl;
 use crate::ipc::event_listener::parse_event;
-use crate::models::{HyprEvent, SessionFile, WindowEntry};
+use crate::models::{HyprEvent, SessionFile, TrackedWindow, WindowEntry};
 
 const WINDOW_APPEAR_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -51,6 +52,45 @@ struct PendingWindow {
     rule_name: String,
 }
 
+/// Windows already live at daemon startup, available to be adopted in place
+/// of launching a duplicate. Only matters when the daemon restarts
+/// mid-session — Hyprland itself always starts with zero windows, so a real
+/// login/reboot leaves this pool empty and restore behaves as before.
+struct LiveWindowPool {
+    windows: Vec<TrackedWindow>,
+}
+
+impl LiveWindowPool {
+    fn new(windows: Vec<TrackedWindow>) -> Self {
+        Self { windows }
+    }
+
+    /// Find and remove the best-matching live window for a plan entry: same
+    /// `app_id` and workspace, breaking ties by nearest saved position. This
+    /// only helps apps that always fork a fresh process (e.g. terminals) —
+    /// single-instance apps already avoid duplication via window-rule
+    /// silent-activation.
+    fn take_match(&mut self, entry: &WindowEntry) -> Option<TrackedWindow> {
+        let best = self
+            .windows
+            .iter()
+            .enumerate()
+            .filter(|(_, w)| w.app_id == entry.app_id && w.workspace == entry.workspace)
+            .min_by_key(|(_, w)| position_distance_sq(w.position, entry.position))
+            .map(|(i, _)| i)?;
+        Some(self.windows.remove(best))
+    }
+}
+
+fn position_distance_sq(live: (i32, i32), saved: Option<(i32, i32)>) -> i64 {
+    let Some((sx, sy)) = saved else {
+        return 0;
+    };
+    let dx = i64::from(live.0 - sx);
+    let dy = i64::from(live.1 - sy);
+    dx * dx + dy * dy
+}
+
 pub struct RestoreEngine {
     restore_geometry: bool,
     restore_layout: bool,
@@ -68,7 +108,9 @@ impl RestoreEngine {
         &self,
         session: &SessionFile,
         ctl: &HyprCtl,
+        live_windows: Vec<TrackedWindow>,
     ) -> Result<(RestoreReport, Option<JoinHandle<()>>)> {
+        let mut live_pool = LiveWindowPool::new(live_windows);
         let mut report = RestoreReport::default();
         let total = session.windows.len();
         tracing::info!(
@@ -116,6 +158,7 @@ impl RestoreEngine {
                 &mut report,
                 &mut active_rules,
                 &mut pending,
+                &mut live_pool,
             )
             .await?;
         } else {
@@ -126,6 +169,7 @@ impl RestoreEngine {
                 &mut report,
                 &mut active_rules,
                 &mut pending,
+                &mut live_pool,
             )
             .await?;
         }
@@ -172,6 +216,7 @@ impl RestoreEngine {
         Ok((report, watcher_handle))
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn restore_simple(
         &self,
         session: &SessionFile,
@@ -180,6 +225,7 @@ impl RestoreEngine {
         report: &mut RestoreReport,
         active_rules: &mut Vec<String>,
         pending: &mut Vec<PendingWindow>,
+        live_pool: &mut LiveWindowPool,
     ) -> Result<()> {
         let total = session.windows.len();
         for (i, window) in session.windows.iter().enumerate() {
@@ -192,10 +238,10 @@ impl RestoreEngine {
             );
 
             match self
-                .restore_window(window, ctl, events, active_rules, pending)
+                .restore_window(window, ctl, events, active_rules, pending, live_pool)
                 .await
             {
-                Ok(()) => {
+                Ok(_) => {
                     report.restored += 1;
                     tracing::info!("  restored {}", window.app_id);
                 }
@@ -219,6 +265,7 @@ impl RestoreEngine {
     /// Auto-detects the active Hyprland layout (dwindle, master, ...) and
     /// dispatches to the appropriate strategy. Falls back to simple restore
     /// for unknown layouts.
+    #[allow(clippy::too_many_arguments)]
     async fn restore_with_layout(
         &self,
         session: &SessionFile,
@@ -227,31 +274,57 @@ impl RestoreEngine {
         report: &mut RestoreReport,
         active_rules: &mut Vec<String>,
         pending: &mut Vec<PendingWindow>,
+        live_pool: &mut LiveWindowPool,
     ) -> Result<()> {
         let layout = ctl.get_layout().await.unwrap_or_default();
         tracing::info!("detected layout: {layout:?}");
 
         match layout.as_str() {
             "dwindle" => {
-                self.restore_dwindle(session, ctl, events, report, active_rules, pending)
-                    .await
+                self.restore_dwindle(
+                    session,
+                    ctl,
+                    events,
+                    report,
+                    active_rules,
+                    pending,
+                    live_pool,
+                )
+                .await
             }
             "master" => {
-                self.restore_master(session, ctl, events, report, active_rules, pending)
-                    .await
+                self.restore_master(
+                    session,
+                    ctl,
+                    events,
+                    report,
+                    active_rules,
+                    pending,
+                    live_pool,
+                )
+                .await
             }
             other => {
                 tracing::warn!(
                     "layout {other:?} has no layout-aware restore, falling back to simple"
                 );
-                self.restore_simple(session, ctl, events, report, active_rules, pending)
-                    .await
+                self.restore_simple(
+                    session,
+                    ctl,
+                    events,
+                    report,
+                    active_rules,
+                    pending,
+                    live_pool,
+                )
+                .await
             }
         }
     }
 
     /// Dwindle restore: BSP inference, preselect-based placement, then
     /// splitratio application and convergence.
+    #[allow(clippy::too_many_arguments)]
     async fn restore_dwindle(
         &self,
         session: &SessionFile,
@@ -260,6 +333,7 @@ impl RestoreEngine {
         report: &mut RestoreReport,
         active_rules: &mut Vec<String>,
         pending: &mut Vec<PendingWindow>,
+        live_pool: &mut LiveWindowPool,
     ) -> Result<()> {
         let (floating, ws_plans, fallback_windows) = Self::build_dwindle_plans(session);
 
@@ -272,6 +346,7 @@ impl RestoreEngine {
                 &ws_plans,
                 active_rules,
                 pending,
+                live_pool,
             )
             .await?;
 
@@ -288,6 +363,7 @@ impl RestoreEngine {
             "fallback",
             active_rules,
             pending,
+            live_pool,
         )
         .await?;
         self.restore_indexed(
@@ -299,6 +375,7 @@ impl RestoreEngine {
             "float",
             active_rules,
             pending,
+            live_pool,
         )
         .await?;
 
@@ -307,6 +384,7 @@ impl RestoreEngine {
 
     /// Master layout restore: infer master/stack split, set orientation and
     /// mfact, open master windows first then stack windows.
+    #[allow(clippy::too_many_arguments)]
     async fn restore_master(
         &self,
         session: &SessionFile,
@@ -315,6 +393,7 @@ impl RestoreEngine {
         report: &mut RestoreReport,
         active_rules: &mut Vec<String>,
         pending: &mut Vec<PendingWindow>,
+        live_pool: &mut LiveWindowPool,
     ) -> Result<()> {
         let (floating, master_plans, fallback_windows) = Self::build_master_plans(session);
 
@@ -349,10 +428,10 @@ impl RestoreEngine {
                 let window = &session.windows[first_idx];
                 tracing::info!("[master] opening master: {}", window.app_id);
                 match self
-                    .restore_window(window, ctl, events, active_rules, pending)
+                    .restore_window(window, ctl, events, active_rules, pending, live_pool)
                     .await
                 {
-                    Ok(()) => report.restored += 1,
+                    Ok(_) => report.restored += 1,
                     Err(e) => {
                         report.failed += 1;
                         report.errors.push((window.app_id.clone(), e.to_string()));
@@ -360,17 +439,22 @@ impl RestoreEngine {
                 }
             }
 
-            // Open additional master windows and promote them.
+            // Open additional master windows and promote them. Skipped for
+            // adopted windows: an already-live window is already in its
+            // correct slot, and addmaster would instead promote whatever
+            // happens to be focused.
             for &idx in plan.master_indices.iter().skip(1) {
                 let window = &session.windows[idx];
                 tracing::info!("[master] opening extra master: {}", window.app_id);
                 match self
-                    .restore_window(window, ctl, events, active_rules, pending)
+                    .restore_window(window, ctl, events, active_rules, pending, live_pool)
                     .await
                 {
-                    Ok(()) => {
+                    Ok(adopted) => {
                         report.restored += 1;
-                        drop(ctl.dispatch("layoutmsg addmaster").await);
+                        if !adopted {
+                            drop(ctl.dispatch("layoutmsg addmaster").await);
+                        }
                     }
                     Err(e) => {
                         report.failed += 1;
@@ -384,10 +468,10 @@ impl RestoreEngine {
                 let window = &session.windows[idx];
                 tracing::info!("[master] opening stack: {}", window.app_id);
                 match self
-                    .restore_window(window, ctl, events, active_rules, pending)
+                    .restore_window(window, ctl, events, active_rules, pending, live_pool)
                     .await
                 {
-                    Ok(()) => report.restored += 1,
+                    Ok(_) => report.restored += 1,
                     Err(e) => {
                         report.failed += 1;
                         report.errors.push((window.app_id.clone(), e.to_string()));
@@ -408,6 +492,7 @@ impl RestoreEngine {
             "fallback",
             active_rules,
             pending,
+            live_pool,
         )
         .await?;
         self.restore_indexed(
@@ -419,6 +504,7 @@ impl RestoreEngine {
             "float",
             active_rules,
             pending,
+            live_pool,
         )
         .await?;
 
@@ -520,6 +606,7 @@ impl RestoreEngine {
         ws_plans: &HashMap<String, DwindlePlan>,
         active_rules: &mut Vec<String>,
         pending: &mut Vec<PendingWindow>,
+        live_pool: &mut LiveWindowPool,
     ) -> Result<HashMap<usize, String>> {
         let mut addresses: HashMap<usize, String> = HashMap::new();
         let mut sorted_ws: Vec<&String> = ws_plans.keys().collect();
@@ -537,6 +624,14 @@ impl RestoreEngine {
                     step.focus_idx,
                     step.preselect,
                 );
+
+                if let Some(live) = live_pool.take_match(window) {
+                    let addr = normalize_address(&live.address);
+                    tracing::info!("  adopted already-open {} (0x{addr})", window.app_id);
+                    addresses.insert(step.window_idx, addr);
+                    report.restored += 1;
+                    continue;
+                }
 
                 let anchor: Option<(&str, dwindle::PreselDir)> =
                     if let (Some(focus_idx), Some(presel)) = (step.focus_idx, step.preselect)
@@ -872,6 +967,7 @@ impl RestoreEngine {
         label: &str,
         active_rules: &mut Vec<String>,
         pending: &mut Vec<PendingWindow>,
+        live_pool: &mut LiveWindowPool,
     ) -> Result<()> {
         for &idx in indices {
             let window = &session.windows[idx];
@@ -881,10 +977,10 @@ impl RestoreEngine {
                 window.workspace
             );
             match self
-                .restore_window(window, ctl, events, active_rules, pending)
+                .restore_window(window, ctl, events, active_rules, pending, live_pool)
                 .await
             {
-                Ok(()) => report.restored += 1,
+                Ok(_) => report.restored += 1,
                 Err(e) => {
                     report.failed += 1;
                     report.errors.push((window.app_id.clone(), e.to_string()));
@@ -965,6 +1061,9 @@ impl RestoreEngine {
         }
     }
 
+    /// Restore a single window. Returns `Ok(true)` if an already-live window
+    /// was adopted instead of launching a duplicate, `Ok(false)` otherwise
+    /// (freshly launched, or deferred to the late-window watcher).
     async fn restore_window(
         &self,
         window: &WindowEntry,
@@ -972,13 +1071,23 @@ impl RestoreEngine {
         events: &mut mpsc::Receiver<HyprEvent>,
         active_rules: &mut Vec<String>,
         pending: &mut Vec<PendingWindow>,
-    ) -> Result<()> {
+        live_pool: &mut LiveWindowPool,
+    ) -> Result<bool> {
+        if let Some(live) = live_pool.take_match(window) {
+            tracing::info!(
+                "  adopted already-open {} (0x{})",
+                window.app_id,
+                normalize_address(&live.address)
+            );
+            return Ok(true);
+        }
+
         let addr = self
             .launch_and_track(window, ctl, events, active_rules, pending)
             .await?;
 
         let Some(addr) = addr else {
-            return Ok(());
+            return Ok(false);
         };
 
         if self.restore_geometry {
@@ -999,7 +1108,7 @@ impl RestoreEngine {
             }
         }
 
-        Ok(())
+        Ok(false)
     }
 
     async fn wait_for_open_event(
@@ -1376,6 +1485,42 @@ mod tests {
             size: None,
             cwd: cwd.map(String::from),
             profile: profile.map(String::from),
+        }
+    }
+
+    fn make_tracked(
+        address: &str,
+        app_id: &str,
+        workspace: &str,
+        position: (i32, i32),
+    ) -> TrackedWindow {
+        TrackedWindow {
+            address: address.to_string(),
+            app_id: app_id.to_string(),
+            launch_cmd: format!("{app_id}-cmd"),
+            workspace: workspace.to_string(),
+            monitor: String::new(),
+            position,
+            size: (800, 600),
+            floating: false,
+            fullscreen: false,
+            pid: 0,
+            profile: None,
+        }
+    }
+
+    fn entry_with_position(app_id: &str, workspace: &str, position: (i32, i32)) -> WindowEntry {
+        WindowEntry {
+            app_id: app_id.to_string(),
+            launch_cmd: app_id.to_string(),
+            workspace: workspace.to_string(),
+            monitor: None,
+            floating: false,
+            fullscreen: false,
+            position: Some(position),
+            size: None,
+            cwd: None,
+            profile: None,
         }
     }
 
@@ -1782,6 +1927,295 @@ mod tests {
         assert_eq!(
             float_count, 2,
             "expected float + settile (2x setfloating), got: {commands:?}"
+        );
+        drop(commands);
+
+        s1.abort();
+    }
+
+    // --- LiveWindowPool ---
+
+    #[test]
+    fn live_pool_matches_by_class_and_workspace() {
+        let mut pool = LiveWindowPool::new(vec![make_tracked("0xabc", "foot", "1", (0, 0))]);
+        let entry = make_entry("foot", "foot", None, None);
+
+        let matched = pool.take_match(&entry).expect("expected a match");
+        assert_eq!(matched.address, "0xabc");
+    }
+
+    #[test]
+    fn live_pool_no_match_different_class() {
+        let mut pool = LiveWindowPool::new(vec![make_tracked("0xabc", "kitty", "1", (0, 0))]);
+        let entry = make_entry("foot", "foot", None, None);
+
+        assert!(pool.take_match(&entry).is_none());
+    }
+
+    #[test]
+    fn live_pool_no_match_different_workspace() {
+        let mut pool = LiveWindowPool::new(vec![make_tracked("0xabc", "foot", "2", (0, 0))]);
+        let entry = make_entry("foot", "foot", None, None);
+
+        assert!(pool.take_match(&entry).is_none());
+    }
+
+    #[test]
+    fn live_pool_does_not_reuse_claimed_window() {
+        let mut pool = LiveWindowPool::new(vec![make_tracked("0xabc", "foot", "1", (0, 0))]);
+        let entry = make_entry("foot", "foot", None, None);
+
+        assert!(pool.take_match(&entry).is_some());
+        assert!(
+            pool.take_match(&entry).is_none(),
+            "the same live window must not be adopted twice"
+        );
+    }
+
+    #[test]
+    fn live_pool_prefers_nearest_saved_position_on_tie() {
+        let mut pool = LiveWindowPool::new(vec![
+            make_tracked("0xnear", "foot", "1", (100, 100)),
+            make_tracked("0xfar", "foot", "1", (900, 900)),
+        ]);
+        let entry = entry_with_position("foot", "1", (120, 110));
+
+        let matched = pool.take_match(&entry).expect("expected a match");
+        assert_eq!(matched.address, "0xnear");
+    }
+
+    /// Models the real-world 2x2-grid bug scenario: four same-class terminals
+    /// already live on one workspace must each be matched to the plan entry
+    /// with the nearest saved position, with no live window claimed twice.
+    #[test]
+    fn live_pool_matches_2x2_grid_without_double_claiming() {
+        let mut pool = LiveWindowPool::new(vec![
+            make_tracked("0xa", "foot", "1", (0, 0)),
+            make_tracked("0xb", "foot", "1", (960, 0)),
+            make_tracked("0xc", "foot", "1", (0, 540)),
+            make_tracked("0xd", "foot", "1", (960, 540)),
+        ]);
+
+        let expected = [
+            ((10, 10), "0xa"),
+            ((950, 10), "0xb"),
+            ((10, 530), "0xc"),
+            ((950, 530), "0xd"),
+        ];
+
+        for (position, expected_addr) in expected {
+            let entry = entry_with_position("foot", "1", position);
+            let matched = pool.take_match(&entry).expect("expected a match");
+            assert_eq!(matched.address, expected_addr);
+        }
+
+        let entry = entry_with_position("foot", "1", (10, 10));
+        assert!(
+            pool.take_match(&entry).is_none(),
+            "all four live windows should already be claimed"
+        );
+    }
+
+    // --- restore_window adoption ---
+
+    /// When a live window matches, restore_window must adopt it instead of
+    /// launching a duplicate: no window rule, no exec, no geometry dispatch.
+    #[tokio::test]
+    async fn restore_window_adopts_live_window_without_dispatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock1 = dir.path().join("s1.sock");
+        let sock2 = dir.path().join("s2.sock");
+
+        let (mock1, log) = RecordingSocket1::new(&sock1);
+        let s1 = tokio::spawn(mock1.serve());
+
+        let ctl = HyprCtl::new(HyprSocketPaths::new(sock1, sock2));
+        let engine = RestoreEngine::new(true, true);
+        let (_tx, mut events) = mpsc::channel::<HyprEvent>(8);
+
+        let mut active_rules = Vec::new();
+        let mut pending = Vec::new();
+        let mut live_pool = LiveWindowPool::new(vec![make_tracked("0xlive1", "foot", "1", (0, 0))]);
+        let window = make_entry("foot", "foot", None, None);
+
+        let adopted = engine
+            .restore_window(
+                &window,
+                &ctl,
+                &mut events,
+                &mut active_rules,
+                &mut pending,
+                &mut live_pool,
+            )
+            .await
+            .unwrap();
+
+        assert!(adopted, "expected the live window to be adopted");
+        assert!(active_rules.is_empty(), "no rule should be created");
+        assert!(pending.is_empty(), "nothing should be deferred");
+
+        let commands = log.lock().await;
+        assert!(
+            commands.is_empty(),
+            "adopting a live window must not issue any hyprctl dispatch, got: {commands:?}"
+        );
+        drop(commands);
+
+        s1.abort();
+    }
+
+    /// With no matching live window, restore_window falls back to the
+    /// existing launch-and-track behavior.
+    #[tokio::test]
+    async fn restore_window_launches_when_no_live_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock1 = dir.path().join("s1.sock");
+        let sock2 = dir.path().join("s2.sock");
+
+        let (mock1, log) = RecordingSocket1::new(&sock1);
+        let s1 = tokio::spawn(mock1.serve());
+
+        let ctl = HyprCtl::new(HyprSocketPaths::new(sock1, sock2));
+        let engine = RestoreEngine::new(true, true);
+        let (event_tx, mut events) = mpsc::channel::<HyprEvent>(8);
+        event_tx
+            .send(HyprEvent::OpenWindow {
+                address: "newwin".to_string(),
+                workspace: "1".to_string(),
+                class: "foot".to_string(),
+            })
+            .await
+            .unwrap();
+
+        let mut active_rules = Vec::new();
+        let mut pending = Vec::new();
+        let mut live_pool =
+            LiveWindowPool::new(vec![make_tracked("0xother", "kitty", "1", (0, 0))]);
+        let window = make_entry("foot", "foot", None, None);
+
+        let adopted = engine
+            .restore_window(
+                &window,
+                &ctl,
+                &mut events,
+                &mut active_rules,
+                &mut pending,
+                &mut live_pool,
+            )
+            .await
+            .unwrap();
+
+        assert!(!adopted, "no matching live window, should launch instead");
+
+        let commands = log.lock().await;
+        assert!(
+            commands
+                .iter()
+                .any(|c| c.contains("exec [workspace 1 silent] foot")),
+            "expected a launch dispatch, got: {commands:?}"
+        );
+        drop(commands);
+
+        s1.abort();
+    }
+
+    // --- execute_bsp_plans adoption ---
+
+    /// When the first BSP step's window is already live, execute_bsp_plans
+    /// must adopt it without touching the workspace-switch dispatch normally
+    /// issued for an anchor-less first step, and later steps must anchor
+    /// against the adopted window's (normalized) address.
+    #[tokio::test]
+    async fn execute_bsp_plans_adopts_first_step_and_anchors_second_to_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock1 = dir.path().join("s1.sock");
+        let sock2 = dir.path().join("s2.sock");
+
+        let (mock1, log) = RecordingSocket1::new(&sock1);
+        let s1 = tokio::spawn(mock1.serve());
+
+        let ctl = HyprCtl::new(HyprSocketPaths::new(sock1, sock2));
+        let engine = RestoreEngine::new(false, true);
+
+        let (event_tx, mut events) = mpsc::channel::<HyprEvent>(8);
+        event_tx
+            .send(HyprEvent::OpenWindow {
+                address: "newwin1".to_string(),
+                workspace: "1".to_string(),
+                class: "foot".to_string(),
+            })
+            .await
+            .unwrap();
+
+        let session = SessionFile {
+            session: crate::models::SessionMeta {
+                name: "t".to_string(),
+                timestamp: 0,
+            },
+            windows: vec![
+                make_entry("foot", "foot", None, None),
+                make_entry("foot", "foot", None, None),
+            ],
+        };
+
+        let mut ws_plans = HashMap::new();
+        ws_plans.insert(
+            "1".to_string(),
+            DwindlePlan {
+                steps: vec![
+                    dwindle::RestoreStep {
+                        window_idx: 0,
+                        focus_idx: None,
+                        preselect: None,
+                    },
+                    dwindle::RestoreStep {
+                        window_idx: 1,
+                        focus_idx: Some(0),
+                        preselect: Some(dwindle::PreselDir::Right),
+                    },
+                ],
+                ratio_steps: vec![],
+            },
+        );
+
+        let mut report = RestoreReport::default();
+        let mut active_rules = Vec::new();
+        let mut pending = Vec::new();
+        let mut live_pool =
+            LiveWindowPool::new(vec![make_tracked("0xLIVE01", "foot", "1", (0, 0))]);
+
+        let addresses = engine
+            .execute_bsp_plans(
+                &session,
+                &ctl,
+                &mut events,
+                &mut report,
+                &ws_plans,
+                &mut active_rules,
+                &mut pending,
+                &mut live_pool,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(report.restored, 2);
+        assert_eq!(addresses.get(&0), Some(&"live01".to_string()));
+        assert_eq!(addresses.get(&1), Some(&"newwin1".to_string()));
+
+        let commands = log.lock().await;
+        assert!(
+            !commands.iter().any(|c| c.contains("dispatch workspace 1")),
+            "adopting the first step must not dispatch a workspace switch, got: {commands:?}"
+        );
+        assert!(
+            commands
+                .iter()
+                .any(|c| c.contains("focuswindow address:0xlive01")),
+            "second step must anchor to the adopted window's address, got: {commands:?}"
+        );
+        assert!(
+            commands.iter().any(|c| c.contains("layoutmsg preselect r")),
+            "expected preselect for the second step, got: {commands:?}"
         );
         drop(commands);
 
