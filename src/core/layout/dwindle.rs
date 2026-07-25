@@ -570,8 +570,8 @@ mod tests {
         assert_eq!(plan.unwrap().steps.len(), 4);
     }
 
-    /// Real-world 2x2 grid geometry (zen3bot workspace 4: two Alacritty
-    /// terminals stacked in a left column, discord+slack stacked in a right
+    /// Real-world 2x2 grid geometry (a live workspace: two terminals
+    /// stacked in a left column, two other apps stacked in a right
     /// column), array order [a0(top), a1(bottom), discord, slack] with
     /// global indices [0, 1, 2, 3].
     ///
