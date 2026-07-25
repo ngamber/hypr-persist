@@ -1074,6 +1074,18 @@ impl RestoreEngine {
     /// restore, in whatever shape the current tree gives them, so nudging
     /// them toward the saved size fights the tree's actual layout instead of
     /// correcting anything (observed: a window driven to near-zero size).
+    ///
+    /// At most one window is resized per pass. `resizewindowpixel` walks up
+    /// the BSP tree to the nearest ancestor split matching each axis, so
+    /// correcting one window's width or height can silently correct a
+    /// sibling sharing that same ancestor split too. Issuing independent
+    /// resizes for two such windows in the same pass fights over that shared
+    /// edge from both sides at once — live-tested and observed to reject
+    /// both with "Invalid size" and, over several passes, escalate rather
+    /// than converge. Serializing to one resize per pass means a sibling
+    /// whose mismatch was resolved as a side effect simply reads as already
+    /// converged next pass, and only genuinely independent windows consume
+    /// their own pass.
     async fn converge_tiled_sizes(
         &self,
         session: &SessionFile,
@@ -1081,16 +1093,27 @@ impl RestoreEngine {
         addresses: &HashMap<usize, String>,
         adopted: &HashSet<usize>,
     ) {
-        const MAX_PASSES: usize = 4;
         const TOLERANCE: i32 = 6;
 
-        for pass in 0..MAX_PASSES {
-            let mut all_ok = true;
+        let mut candidates: Vec<(usize, &String)> = addresses
+            .iter()
+            .filter(|(idx, _)| !adopted.contains(idx))
+            .map(|(idx, addr)| (*idx, addr))
+            .collect();
+        candidates.sort_by_key(|(idx, _)| *idx);
 
-            for (idx, addr) in addresses {
-                if adopted.contains(idx) {
-                    continue;
-                }
+        if candidates.is_empty() {
+            return;
+        }
+
+        // Generous margin over one-resize-per-pass: every candidate may need
+        // its own pass, plus room for a couple of settling passes.
+        let max_passes = candidates.len() + 2;
+
+        for pass in 0..max_passes {
+            let mut resized = false;
+
+            for (idx, addr) in &candidates {
                 let window = &session.windows[*idx];
                 let Some((saved_w, saved_h)) = window.size else {
                     continue;
@@ -1103,7 +1126,6 @@ impl RestoreEngine {
                 let dh = saved_h - client.size.1;
 
                 if dw.abs() > TOLERANCE || dh.abs() > TOLERANCE {
-                    all_ok = false;
                     tracing::debug!(
                         "  pass {}: resize {} by ({dw}, {dh})",
                         pass + 1,
@@ -1119,17 +1141,19 @@ impl RestoreEngine {
                         Err(e) => tracing::warn!("  resize ipc error: {e}"),
                         _ => {}
                     }
+                    resized = true;
+                    break;
                 }
             }
 
-            if all_ok {
+            if !resized {
                 tracing::debug!("  tiled sizes converged after {} pass(es)", pass + 1);
                 return;
             }
 
             tokio::time::sleep(Duration::from_millis(60)).await;
         }
-        tracing::debug!("  tiled sizes settled after {MAX_PASSES} passes");
+        tracing::debug!("  tiled sizes settled after {max_passes} passes");
     }
 
     /// `fullscreen` is a toggle, not a set — an adopted window that was
@@ -2608,6 +2632,79 @@ mod tests {
         assert!(
             commands.is_empty(),
             "adopted window must not be queried or resized at all, got: {commands:?}"
+        );
+        drop(commands);
+
+        s1.abort();
+    }
+
+    /// Two tiled windows sharing a BSP split edge (e.g. left/right column
+    /// mates in a 2x2 dwindle grid) must never both be independently resized
+    /// in the same pass. The mock's `j/clients` response is static, so
+    /// neither window's mismatch ever actually resolves — meaning a fixed
+    /// implementation must keep retrying only the first (lowest-index)
+    /// still-mismatched candidate every pass, and must never reach the
+    /// second while the first remains unresolved. The pre-fix algorithm
+    /// dispatched a resize for every out-of-tolerance window unconditionally
+    /// within the same pass, which is exactly the shared-edge fight observed
+    /// on a real reboot (both sides independently fighting over the same
+    /// boundary, rejected as "Invalid size").
+    #[tokio::test]
+    async fn converge_tiled_sizes_never_resizes_two_shared_edge_windows_in_one_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock1 = dir.path().join("s1.sock");
+        let sock2 = dir.path().join("s2.sock");
+
+        let clients_json = r#"[{"address":"0xleft001","class":"discord","pid":1,
+            "workspace":{"id":4,"name":"4"},"monitor":0,
+            "at":[0,0],"size":[1120,563],"floating":false,"fullscreen":0},
+            {"address":"0xright01","class":"thunar","pid":2,
+            "workspace":{"id":4,"name":"4"},"monitor":0,
+            "at":[1120,0],"size":[1410,563],"floating":false,"fullscreen":0}]"#
+            .to_string();
+
+        let (mock1, log, _clients) = RecordingSocket1::with_clients(&sock1, clients_json);
+        let s1 = tokio::spawn(mock1.serve());
+
+        let ctl = HyprCtl::new(HyprSocketPaths::new(sock1, sock2));
+        let engine = RestoreEngine::new(true, true);
+
+        let mut left = entry_with_position("discord", "4", (0, 0));
+        left.size = Some((1265, 563));
+        let mut right = entry_with_position("thunar", "4", (1265, 0));
+        right.size = Some((1265, 563));
+
+        let session = SessionFile {
+            session: crate::models::SessionMeta {
+                name: "t".to_string(),
+                timestamp: 0,
+            },
+            windows: vec![left, right],
+        };
+
+        let mut addresses = HashMap::new();
+        addresses.insert(0usize, "left001".to_string());
+        addresses.insert(1usize, "right01".to_string());
+        let adopted = HashSet::new();
+
+        engine
+            .converge_tiled_sizes(&session, &ctl, &addresses, &adopted)
+            .await;
+
+        let commands = log.lock().await;
+        let resize_cmds: Vec<&String> = commands
+            .iter()
+            .filter(|c| c.contains("resizewindowpixel"))
+            .collect();
+        assert!(
+            !resize_cmds.is_empty(),
+            "expected at least one resize attempt, got: {commands:?}"
+        );
+        assert!(
+            resize_cmds.iter().all(|c| c.contains("address:0xleft001")),
+            "the second window sharing the split edge must never be \
+             independently resized while the first remains unresolved in \
+             the same run, got: {commands:?}"
         );
         drop(commands);
 
