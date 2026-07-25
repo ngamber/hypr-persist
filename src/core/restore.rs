@@ -146,6 +146,17 @@ impl LiveWindowPool {
         self.claimed.insert(addr.clone());
         Some(addr)
     }
+
+    /// Marks a window's address as claimed so a later plan entry for the
+    /// same `app_id` never mistakes it for a racing autostart window via
+    /// `find_unclaimed_racing_window`. Must be called for every window a
+    /// plan entry ends up genuinely owning (not just adopted ones, which
+    /// `find_unclaimed_racing_window` already claims) — otherwise a second
+    /// same-class entry (e.g. two terminal windows) steals the first
+    /// entry's freshly-opened window instead of getting its own.
+    fn mark_claimed(&mut self, addr: &str) {
+        self.claimed.insert(normalize_address(addr));
+    }
 }
 
 fn position_distance_sq(live: (i32, i32), saved: Option<(i32, i32)>) -> i64 {
@@ -845,6 +856,7 @@ impl RestoreEngine {
                     anchor,
                 )
                 .await;
+            live_pool.mark_claimed(&final_addr);
             Ok(LaunchOutcome::Opened(final_addr))
         } else if let Some(addr) = live_pool
             .find_unclaimed_racing_window(ctl, &window.app_id)
@@ -1246,6 +1258,7 @@ impl RestoreEngine {
                 ))
                 .await,
             );
+            live_pool.mark_claimed(addr);
             Ok(LaunchOutcome::Opened(addr.clone()))
         } else if let Some(addr) = live_pool
             .find_unclaimed_racing_window(ctl, &window.app_id)
@@ -2863,6 +2876,105 @@ mod tests {
 
         s1.abort();
         updater.abort();
+    }
+
+    /// Two session-file entries of the same class (e.g. two terminal
+    /// windows) must each get their own live window. Before the window a
+    /// genuinely-launched entry opens was marked claimed, a second entry
+    /// for the same `app_id` would see it via `find_unclaimed_racing_window`
+    /// (it postdates `known_at_startup`, which is empty on a real
+    /// login/reboot) and wrongly adopt it instead of launching its own —
+    /// the live bug this test guards against.
+    #[tokio::test]
+    async fn bsp_launch_and_track_does_not_steal_previously_opened_window_of_same_class() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock1 = dir.path().join("s1.sock");
+        let sock2 = dir.path().join("s2.sock");
+
+        let (mock1, log, clients_handle) = RecordingSocket1::with_clients(&sock1, "[]".to_string());
+        let s1 = tokio::spawn(mock1.serve());
+
+        let ctl = HyprCtl::new(HyprSocketPaths::new(sock1, sock2));
+        let engine = RestoreEngine::new(true, true);
+        let (event_tx, mut events) = mpsc::channel::<HyprEvent>(8);
+        let mut active_rules = Vec::new();
+        let mut pending = Vec::new();
+        let mut rule_counter = 0usize;
+        let mut live_pool = LiveWindowPool::new(vec![]);
+        let window = make_entry("alacritty", "alacritty", None, None);
+
+        event_tx
+            .send(HyprEvent::OpenWindow {
+                address: "alac1".to_string(),
+                workspace: "1".to_string(),
+                class: "alacritty".to_string(),
+            })
+            .await
+            .unwrap();
+
+        let first = engine
+            .bsp_launch_and_track(
+                &window,
+                &ctl,
+                &mut events,
+                &mut active_rules,
+                &mut pending,
+                &mut rule_counter,
+                None,
+                &mut live_pool,
+            )
+            .await
+            .unwrap();
+        match first {
+            LaunchOutcome::Opened(addr) => assert_eq!(addr, "alac1"),
+            other => panic!("expected the first entry to open its own window, got {other:?}"),
+        }
+
+        // Hyprland now genuinely reports the first window as live, exactly
+        // as it would once `exec` has actually run.
+        *clients_handle.lock().await = single_client_json("0xalac1", "alacritty", "1");
+        event_tx
+            .send(HyprEvent::OpenWindow {
+                address: "alac2".to_string(),
+                workspace: "1".to_string(),
+                class: "alacritty".to_string(),
+            })
+            .await
+            .unwrap();
+
+        let second = engine
+            .bsp_launch_and_track(
+                &window,
+                &ctl,
+                &mut events,
+                &mut active_rules,
+                &mut pending,
+                &mut rule_counter,
+                None,
+                &mut live_pool,
+            )
+            .await
+            .unwrap();
+        match second {
+            LaunchOutcome::Opened(addr) => assert_eq!(addr, "alac2"),
+            other => panic!(
+                "second entry must launch and open its own window instead of stealing the \
+                 first's, got {other:?}"
+            ),
+        }
+
+        let commands = log.lock().await;
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|c| c.contains("exec alacritty"))
+                .count(),
+            2,
+            "both entries must have issued their own real launch, got: {commands:?}"
+        );
+        drop(commands);
+
+        s1.abort();
     }
 
     // --- racing-autostart adoption composed with execute_bsp_plans ---
