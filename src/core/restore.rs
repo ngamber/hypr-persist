@@ -1039,6 +1039,16 @@ impl RestoreEngine {
         // its own pass, plus room for a couple of settling passes.
         let max_passes = candidates.len() + 2;
 
+        // Tracks the last delta dispatched for each candidate so an
+        // unchanging live size (e.g. a resize Hyprland keeps rejecting)
+        // doesn't get the identical dispatch re-issued, and re-warned about,
+        // on every subsequent pass. Observed live: a resize computing the
+        // same (dw, dh) on every pass, rejected as "Invalid size" each time,
+        // yet the final live geometry matched the saved session exactly —
+        // i.e. a repeat of the same input can only repeat the same doomed
+        // outcome, so it's demoted to debug instead of warning every pass.
+        let mut last_attempted: HashMap<usize, (i32, i32)> = HashMap::new();
+
         for pass in 0..max_passes {
             let mut resized = false;
 
@@ -1055,20 +1065,30 @@ impl RestoreEngine {
                 let dh = saved_h - client.size.1;
 
                 if dw.abs() > TOLERANCE || dh.abs() > TOLERANCE {
-                    tracing::debug!(
-                        "  pass {}: resize {} by ({dw}, {dh})",
-                        pass + 1,
-                        window.app_id,
-                    );
-                    match ctl
-                        .dispatch(&format!("resizewindowpixel {dw} {dh},address:0x{addr}"))
-                        .await
-                    {
-                        Ok(resp) if resp.trim() != "ok" => {
-                            tracing::warn!("  resize failed: {resp}");
+                    if last_attempted.get(idx) == Some(&(dw, dh)) {
+                        tracing::debug!(
+                            "  pass {}: {} still off by ({dw}, {dh}), matching the \
+                             previous attempt — not re-dispatching",
+                            pass + 1,
+                            window.app_id,
+                        );
+                    } else {
+                        tracing::debug!(
+                            "  pass {}: resize {} by ({dw}, {dh})",
+                            pass + 1,
+                            window.app_id,
+                        );
+                        last_attempted.insert(*idx, (dw, dh));
+                        match ctl
+                            .dispatch(&format!("resizewindowpixel {dw} {dh},address:0x{addr}"))
+                            .await
+                        {
+                            Ok(resp) if resp.trim() != "ok" => {
+                                tracing::warn!("  resize failed: {resp}");
+                            }
+                            Err(e) => tracing::warn!("  resize ipc error: {e}"),
+                            _ => {}
                         }
-                        Err(e) => tracing::warn!("  resize ipc error: {e}"),
-                        _ => {}
                     }
                     resized = true;
                     break;
@@ -2792,6 +2812,62 @@ mod tests {
             "the second window sharing the split edge must never be \
              independently resized while the first remains unresolved in \
              the same run, got: {commands:?}"
+        );
+        drop(commands);
+
+        s1.abort();
+    }
+
+    /// A resize whose computed delta never changes pass over pass (e.g.
+    /// because the live client's reported size never moves, meaning
+    /// Hyprland rejected the previous attempt) must only be dispatched once.
+    /// Re-issuing the identical resize every pass produces a warning on
+    /// every restore with no corrective effect — observed live as repeated
+    /// "Invalid size" rejections despite the final geometry matching the
+    /// saved session exactly.
+    #[tokio::test]
+    async fn converge_tiled_sizes_does_not_redispatch_identical_stuck_delta() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock1 = dir.path().join("s1.sock");
+        let sock2 = dir.path().join("s2.sock");
+
+        let clients_json = r#"[{"address":"0xstuck01","class":"discord","pid":1,
+            "workspace":{"id":4,"name":"4"},"monitor":0,
+            "at":[0,0],"size":[700,500],"floating":false,"fullscreen":0}]"#
+            .to_string();
+
+        let (mock1, log, _clients) = RecordingSocket1::with_clients(&sock1, clients_json);
+        let s1 = tokio::spawn(mock1.serve());
+
+        let ctl = HyprCtl::new(HyprSocketPaths::new(sock1, sock2));
+        let engine = RestoreEngine::new(true, true);
+
+        let mut window = entry_with_position("discord", "4", (0, 0));
+        window.size = Some((800, 600));
+        let session = SessionFile {
+            session: crate::models::SessionMeta {
+                name: "t".to_string(),
+                timestamp: 0,
+            },
+            windows: vec![window],
+        };
+
+        let mut addresses = HashMap::new();
+        addresses.insert(0usize, "stuck01".to_string());
+        let adopted = HashSet::new();
+
+        engine
+            .converge_tiled_sizes(&session, &ctl, &addresses, &adopted)
+            .await;
+
+        let commands = log.lock().await;
+        let resize_count = commands
+            .iter()
+            .filter(|c| c.contains("resizewindowpixel"))
+            .count();
+        assert_eq!(
+            resize_count, 1,
+            "an unchanging delta must only be dispatched once, got: {commands:?}"
         );
         drop(commands);
 
