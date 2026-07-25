@@ -58,7 +58,12 @@ impl std::fmt::Display for PreselDir {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Right => write!(f, "r"),
-            Self::Bottom => write!(f, "b"),
+            // Hyprland's dwindle `layoutmsg preselect <dir>` only recognizes
+            // l/r/u/d (left/right/up/down) — "b" is not a valid direction.
+            // Live-tested: "b" produced inconsistent placement (looked correct
+            // in simple 2-window cases but landed windows on the wrong side
+            // of the tree entirely once more than ~2 splits were involved).
+            Self::Bottom => write!(f, "d"),
         }
     }
 }
