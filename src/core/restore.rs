@@ -729,14 +729,23 @@ impl RestoreEngine {
                     continue;
                 }
 
+                // Deliberately does NOT arm focuswindow/preselect here: a
+                // binding set up before `exec` has to survive an
+                // indeterminate wait for the window to actually appear
+                // (`bsp_launch_and_track` -> `wait_for_open_event`), and
+                // Hyprland's pending preselect is tied to whatever window is
+                // focused at the moment it's consumed — any intervening
+                // focus change (e.g. an unrelated window closing while a
+                // slow-launching app is still starting) silently invalidates
+                // it. `anchor` is instead handed to `place_window_in_bsp_slot`
+                // (via `bsp_launch_and_track`/`retile_superseding_window`),
+                // which issues focus+preselect fresh immediately before the
+                // settle, once the window's address is already confirmed to
+                // exist.
                 let anchor: Option<(&str, dwindle::PreselDir)> =
                     if let (Some(focus_idx), Some(presel)) = (step.focus_idx, step.preselect)
                         && let Some(focus_addr) = addresses.get(&focus_idx)
                     {
-                        ctl.dispatch(&format!("focuswindow address:0x{focus_addr}"))
-                            .await?;
-                        ctl.dispatch(&format!("layoutmsg preselect {presel}"))
-                            .await?;
                         Some((focus_addr.as_str(), presel))
                     } else {
                         if i == 0 {
@@ -897,22 +906,23 @@ impl RestoreEngine {
     /// second window of the same class shows up too — some apps (observed:
     /// Discord) open a transient splash window before their real main
     /// window, both sharing the same class. If a second window appears, the
-    /// first is a stale splash: its address may already have been used as a
-    /// focus anchor for a sibling window's preselect step, silently
-    /// misplacing it in the BSP tree once the splash closes. Close the
-    /// stale window and redo the correct placement dance against the real
-    /// one: move it to the target workspace (the window rule that would
-    /// normally do this was already disabled once the splash appeared, so
-    /// the real window otherwise opens wherever Hyprland defaults to — the
-    /// currently active workspace, which is not necessarily the target one),
-    /// float it out of the tree, THEN focus the anchor and issue preselect
-    /// as the very last step before settling it back in. Preselect must be
-    /// issued immediately before the floating->tiled transition that
-    /// consumes it — issuing it earlier (with a focus/float sequence still
-    /// to come) risks it being cleared by that intervening tiling-state
-    /// change, which is exactly what caused a live-tested regression:
-    /// Discord landed in the wrong BSP column despite every dispatch
-    /// reporting success.
+    /// first is a stale splash: close it and finalize placement against the
+    /// real one instead.
+    ///
+    /// Either way — splash superseded or not — the window that ends up
+    /// tracked always gets its BSP placement finalized here via
+    /// `place_window_in_bsp_slot`, rather than trusting a preselect binding
+    /// armed before `exec` to survive an indeterminate wait for `OpenWindow`.
+    /// Live-tested regression: an anchored window (Slack, anchored to
+    /// Discord) took ~7s to actually open; an unrelated window closing
+    /// during that wait (ordinary session-startup churn, which shifts
+    /// Hyprland's focused window as a side effect of closing) silently
+    /// invalidated the pre-armed preselect, so Slack landed grouped with
+    /// unrelated windows instead of next to its anchor despite every earlier
+    /// dispatch reporting success. Finalizing the anchor/preselect dance
+    /// here — after the window's address is already confirmed to exist —
+    /// mirrors the same already-proven-robust pattern used for
+    /// racing-adopted and late-appearing windows.
     ///
     /// Returns the address that should be tracked as this window's final
     /// address — either `first_addr` unchanged if no second window showed
@@ -926,28 +936,28 @@ impl RestoreEngine {
         workspace: &str,
         anchor: Option<(&str, dwindle::PreselDir)>,
     ) -> String {
-        let Some(real_addr) = self
+        let final_addr = if let Some(real_addr) = self
             .wait_for_open_event_within(events, class, RETILE_GRACE_PERIOD)
             .await
-        else {
-            return first_addr.to_string();
+        {
+            tracing::info!(
+                "retile: {class} splash (0x{first_addr}) superseded by real window (0x{real_addr})"
+            );
+            if ctl
+                .dispatch(&format!("closewindow address:0x{first_addr}"))
+                .await
+                .is_ok()
+            {
+                tracing::debug!("retile: close stale ok");
+            }
+            real_addr
+        } else {
+            first_addr.to_string()
         };
 
-        tracing::info!(
-            "retile: {class} splash (0x{first_addr}) superseded by real window (0x{real_addr})"
-        );
+        place_window_in_bsp_slot(ctl, &final_addr, workspace, anchor).await;
 
-        if ctl
-            .dispatch(&format!("closewindow address:0x{first_addr}"))
-            .await
-            .is_ok()
-        {
-            tracing::debug!("retile: close stale ok");
-        }
-
-        place_window_in_bsp_slot(ctl, &real_addr, workspace, anchor).await;
-
-        real_addr
+        final_addr
     }
 
     /// Apply `layoutmsg splitratio <delta>` for each split node in the BSP tree
@@ -2237,9 +2247,13 @@ mod tests {
 
     /// When only one window of the class ever appears (no splash), the
     /// grace period expires with nothing new and the original address is
-    /// returned unchanged with no extra dispatch calls.
+    /// returned unchanged — but placement must still be finalized via
+    /// `place_window_in_bsp_slot` (move/focus/float/settle), since that's
+    /// the only point placement is ever explicitly (re)applied for a
+    /// normally-opened window; no anchor here means no focus-anchor/preselect
+    /// dispatch, and no splash means no `closewindow`.
     #[tokio::test]
-    async fn retile_no_supersede_returns_original_address() {
+    async fn retile_no_supersede_still_finalizes_placement() {
         let dir = tempfile::tempdir().unwrap();
         let sock1 = dir.path().join("s1.sock");
         let sock2 = dir.path().join("s2.sock");
@@ -2258,8 +2272,22 @@ mod tests {
         assert_eq!(result, "aaa000");
         let commands = log.lock().await;
         assert!(
-            commands.is_empty(),
-            "no dispatch should happen when no supersede occurs, got: {commands:?}"
+            !commands.iter().any(|c| c.contains("closewindow")),
+            "no supersede occurred, so nothing should be closed, got: {commands:?}"
+        );
+        assert!(
+            commands
+                .iter()
+                .any(|c| c.contains("movetoworkspacesilent 4,address:0xaaa000")),
+            "expected workspace move as part of placement, got: {commands:?}"
+        );
+        let float_count = commands
+            .iter()
+            .filter(|c| c.contains("setfloating address:0xaaa000"))
+            .count();
+        assert_eq!(
+            float_count, 2,
+            "expected float + settle (2x setfloating) even without an anchor, got: {commands:?}"
         );
         drop(commands);
 
@@ -3356,6 +3384,164 @@ mod tests {
         drop(commands);
 
         s1.abort();
+    }
+
+    /// Regression test for a real-reboot bug: an anchored window (slack,
+    /// anchored to discord) whose launch is slow enough that its
+    /// `OpenWindow` event arrives well after `exec`, with an unrelated
+    /// window's `CloseWindow` event arriving during that wait (ordinary
+    /// session-startup churn, observed live: `org.kde.ksecretd` and
+    /// `dev.deedles.Trayscale` both closed on their own while slack was
+    /// still starting). The old code armed `focuswindow`+`layoutmsg
+    /// preselect` against the anchor immediately before `exec`, trusting
+    /// that binding to survive until slack's window actually appeared —
+    /// live-tested and observed to fail: slack landed grouped with unrelated
+    /// windows instead of next to discord. The fix defers the anchor/
+    /// preselect dispatch until slack's address is confirmed via its
+    /// `OpenWindow` event, issuing it fresh immediately before the final
+    /// settle. This asserts that ordering directly: the anchor focus and
+    /// preselect dispatches must not appear before slack's `exec`, and must
+    /// appear right before its settling `setfloating`.
+    ///
+    /// Discord (the anchor) is adopted from the live pool rather than
+    /// launched, so it needs no `OpenWindow` event of its own — otherwise
+    /// its own splash-supersede grace-period wait (`retile_superseding_window`)
+    /// would race the shared events channel against slack's delayed event
+    /// and could swallow it first, an artifact of the single shared channel
+    /// rather than of the bug under test.
+    #[tokio::test]
+    async fn execute_bsp_plans_finalizes_anchor_placement_after_delayed_open_with_intervening_close()
+     {
+        let dir = tempfile::tempdir().unwrap();
+        let sock1 = dir.path().join("s1.sock");
+        let sock2 = dir.path().join("s2.sock");
+
+        let (mock1, log) = RecordingSocket1::new(&sock1);
+        let s1 = tokio::spawn(mock1.serve());
+
+        let ctl = HyprCtl::new(HyprSocketPaths::new(sock1, sock2));
+        let engine = RestoreEngine::new(false, true);
+
+        let (event_tx, mut events) = mpsc::channel::<HyprEvent>(8);
+
+        // Slack's OpenWindow is delayed well past exec; an unrelated
+        // window's CloseWindow arrives first, mirroring the live churn that
+        // preceded the misplacement.
+        let delayer = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            drop(
+                event_tx
+                    .send(HyprEvent::CloseWindow {
+                        address: "unrelated1".to_string(),
+                    })
+                    .await,
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            drop(
+                event_tx
+                    .send(HyprEvent::OpenWindow {
+                        address: "slackwin".to_string(),
+                        workspace: "4".to_string(),
+                        class: "slack".to_string(),
+                    })
+                    .await,
+            );
+        });
+
+        let session = SessionFile {
+            session: crate::models::SessionMeta {
+                name: "t".to_string(),
+                timestamp: 0,
+            },
+            windows: vec![
+                entry_with_position("discord", "4", (0, 0)),
+                entry_with_position("slack", "4", (500, 0)),
+            ],
+        };
+
+        let mut ws_plans = HashMap::new();
+        ws_plans.insert(
+            "4".to_string(),
+            DwindlePlan {
+                steps: vec![
+                    dwindle::RestoreStep {
+                        window_idx: 0,
+                        focus_idx: None,
+                        preselect: None,
+                    },
+                    dwindle::RestoreStep {
+                        window_idx: 1,
+                        focus_idx: Some(0),
+                        preselect: Some(dwindle::PreselDir::Bottom),
+                    },
+                ],
+                ratio_steps: vec![],
+            },
+        );
+
+        let mut report = RestoreReport::default();
+        let mut active_rules = Vec::new();
+        let mut pending = Vec::new();
+        let mut live_pool =
+            LiveWindowPool::new(vec![make_tracked("0xdiscordwin", "discord", "4", (0, 0))]);
+
+        let (addresses, adopted) = engine
+            .execute_bsp_plans(
+                &session,
+                &ctl,
+                &mut events,
+                &mut report,
+                &ws_plans,
+                &mut active_rules,
+                &mut pending,
+                &mut live_pool,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(report.restored, 2);
+        assert_eq!(addresses.get(&0), Some(&"discordwin".to_string()));
+        assert!(adopted.contains(&0), "discord came from the live pool");
+        assert_eq!(addresses.get(&1), Some(&"slackwin".to_string()));
+        assert!(!adopted.contains(&1), "slack was freshly launched");
+
+        let commands = log.lock().await;
+
+        let exec_idx = commands
+            .iter()
+            .position(|c| c.contains("exec slack"))
+            .expect("expected slack's exec dispatch");
+        let anchor_focus_idx = commands
+            .iter()
+            .position(|c| c.contains("focuswindow address:0xdiscordwin"));
+        let preselect_idx = commands
+            .iter()
+            .position(|c| c.contains("layoutmsg preselect d"));
+
+        assert!(
+            anchor_focus_idx.is_none_or(|i| i > exec_idx),
+            "anchor focus must not be armed before exec — a binding set up before an \
+             indeterminate wait for OpenWindow can be silently invalidated by an \
+             intervening focus change, got: {commands:?}"
+        );
+        assert!(
+            preselect_idx.is_some_and(|i| i > exec_idx),
+            "preselect must be issued after slack's window is confirmed to exist, not \
+             armed before exec, got: {commands:?}"
+        );
+
+        let settle_idx = commands
+            .iter()
+            .rposition(|c| c.contains("setfloating address:0xslackwin"))
+            .expect("expected a settle dispatch for slack");
+        assert!(
+            preselect_idx.unwrap() < settle_idx,
+            "preselect must be issued immediately before the final settle, got: {commands:?}"
+        );
+
+        drop(commands);
+        s1.abort();
+        delayer.abort();
     }
 
     // --- racing-autostart adoption in launch_and_track / restore_window ---
