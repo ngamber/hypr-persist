@@ -50,6 +50,10 @@ struct PendingWindow {
     position: Option<(i32, i32)>,
     size: Option<(i32, i32)>,
     rule_name: String,
+    /// BSP-tree anchor sibling and preselect direction known at plan time, if
+    /// any. Owned (not borrowed like the `anchor` param used elsewhere)
+    /// because it's moved into the spawned `watch_late_windows` task.
+    anchor: Option<(String, dwindle::PreselDir)>,
 }
 
 /// Result of attempting to get a window onto the target workspace, one way
@@ -809,8 +813,7 @@ impl RestoreEngine {
                 "  {} already live before launch (racing autostart), adopting 0x{addr}",
                 window.app_id
             );
-            self.place_window_in_bsp_slot(ctl, &addr, &window.workspace, anchor)
-                .await;
+            place_window_in_bsp_slot(ctl, &addr, &window.workspace, anchor).await;
             return Ok(LaunchOutcome::Adopted(addr));
         }
 
@@ -867,8 +870,7 @@ impl RestoreEngine {
                 window.app_id
             );
             disable_all_rules(ctl, &[rule_name]).await;
-            self.place_window_in_bsp_slot(ctl, &addr, &window.workspace, anchor)
-                .await;
+            place_window_in_bsp_slot(ctl, &addr, &window.workspace, anchor).await;
             Ok(LaunchOutcome::Adopted(addr))
         } else {
             tracing::warn!(
@@ -885,6 +887,7 @@ impl RestoreEngine {
                 position: window.position,
                 size: window.size,
                 rule_name,
+                anchor: anchor.map(|(addr, presel)| (addr.to_string(), presel)),
             });
             Ok(LaunchOutcome::Deferred)
         }
@@ -942,83 +945,9 @@ impl RestoreEngine {
             tracing::debug!("retile: close stale ok");
         }
 
-        self.place_window_in_bsp_slot(ctl, &real_addr, workspace, anchor)
-            .await;
+        place_window_in_bsp_slot(ctl, &real_addr, workspace, anchor).await;
 
         real_addr
-    }
-
-    /// Move an already-live window into its BSP-tree slot: workspace, then
-    /// float it out and settle it back in, preselecting against `anchor`
-    /// (focused and preselected as the very last step before settling)
-    /// if one is given. Used both for a splash window's real successor
-    /// (`retile_superseding_window`) and for a window adopted mid-restore
-    /// because it raced ahead of its own launch step (an autostart entry
-    /// that was already running by the time hyprresume got to it).
-    ///
-    /// Preselect must be issued immediately before the floating->tiled
-    /// transition that consumes it — issuing it earlier risks it being
-    /// cleared by an intervening tiling-state change, which is exactly what
-    /// caused a live-tested regression (see `retile_superseding_window`'s
-    /// doc comment for the full story). Deliberately does NOT re-focus
-    /// `addr` right before the final settle: refocusing there breaks the
-    /// preselect binding set up above.
-    async fn place_window_in_bsp_slot(
-        &self,
-        ctl: &HyprCtl,
-        addr: &str,
-        workspace: &str,
-        anchor: Option<(&str, dwindle::PreselDir)>,
-    ) {
-        if ctl
-            .dispatch(&format!(
-                "movetoworkspacesilent {workspace},address:0x{addr}"
-            ))
-            .await
-            .is_ok()
-        {
-            tracing::debug!("place: move to workspace ok");
-        }
-
-        if ctl
-            .dispatch(&format!("focuswindow address:0x{addr}"))
-            .await
-            .is_ok()
-        {
-            tracing::debug!("place: focus ok");
-        }
-        if ctl
-            .dispatch(&format!("setfloating address:0x{addr}"))
-            .await
-            .is_ok()
-        {
-            tracing::debug!("place: float ok");
-        }
-
-        if let Some((anchor_addr, presel)) = anchor {
-            if ctl
-                .dispatch(&format!("focuswindow address:0x{anchor_addr}"))
-                .await
-                .is_ok()
-            {
-                tracing::debug!("place: focus anchor ok");
-            }
-            if ctl
-                .dispatch(&format!("layoutmsg preselect {presel}"))
-                .await
-                .is_ok()
-            {
-                tracing::debug!("place: preselect ok");
-            }
-        }
-
-        if ctl
-            .dispatch(&format!("setfloating address:0x{addr}"))
-            .await
-            .is_ok()
-        {
-            tracing::debug!("place: settle ok");
-        }
     }
 
     /// Apply `layoutmsg splitratio <delta>` for each split node in the BSP tree
@@ -1316,6 +1245,7 @@ impl RestoreEngine {
                 position: window.position,
                 size: window.size,
                 rule_name,
+                anchor: None,
             });
             Ok(LaunchOutcome::Deferred)
         }
@@ -1490,19 +1420,103 @@ async fn watch_late_windows(
     disable_all_rules(&ctl, &remaining_rules).await;
 }
 
+/// Move an already-live window into its BSP-tree slot: workspace, then
+/// float it out and settle it back in, preselecting against `anchor`
+/// (focused and preselected as the very last step before settling)
+/// if one is given. Used for a splash window's real successor
+/// (`retile_superseding_window`), a window adopted mid-restore because it
+/// raced ahead of its own launch step, and a late-appearing window handed
+/// off to the background watcher (`apply_late_window`).
+///
+/// Preselect must be issued immediately before the floating->tiled
+/// transition that consumes it — issuing it earlier risks it being
+/// cleared by an intervening tiling-state change, which is exactly what
+/// caused a live-tested regression (see `retile_superseding_window`'s
+/// doc comment for the full story). Deliberately does NOT re-focus
+/// `addr` right before the final settle: refocusing there breaks the
+/// preselect binding set up above.
+async fn place_window_in_bsp_slot(
+    ctl: &HyprCtl,
+    addr: &str,
+    workspace: &str,
+    anchor: Option<(&str, dwindle::PreselDir)>,
+) {
+    if ctl
+        .dispatch(&format!(
+            "movetoworkspacesilent {workspace},address:0x{addr}"
+        ))
+        .await
+        .is_ok()
+    {
+        tracing::debug!("place: move to workspace ok");
+    }
+
+    if ctl
+        .dispatch(&format!("focuswindow address:0x{addr}"))
+        .await
+        .is_ok()
+    {
+        tracing::debug!("place: focus ok");
+    }
+    if ctl
+        .dispatch(&format!("setfloating address:0x{addr}"))
+        .await
+        .is_ok()
+    {
+        tracing::debug!("place: float ok");
+    }
+
+    if let Some((anchor_addr, presel)) = anchor {
+        if ctl
+            .dispatch(&format!("focuswindow address:0x{anchor_addr}"))
+            .await
+            .is_ok()
+        {
+            tracing::debug!("place: focus anchor ok");
+        }
+        if ctl
+            .dispatch(&format!("layoutmsg preselect {presel}"))
+            .await
+            .is_ok()
+        {
+            tracing::debug!("place: preselect ok");
+        }
+    }
+
+    if ctl
+        .dispatch(&format!("setfloating address:0x{addr}"))
+        .await
+        .is_ok()
+    {
+        tracing::debug!("place: settle ok");
+    }
+}
+
 async fn apply_late_window(
     ctl: &HyprCtl,
     pw: &PendingWindow,
     address: &str,
     restore_geometry: bool,
 ) {
-    drop(
-        ctl.dispatch(&format!(
-            "movetoworkspacesilent {},address:0x{address}",
-            pw.workspace
-        ))
-        .await,
-    );
+    if !pw.floating
+        && let Some((anchor_addr, presel)) = &pw.anchor
+    {
+        place_window_in_bsp_slot(
+            ctl,
+            address,
+            &pw.workspace,
+            Some((anchor_addr.as_str(), *presel)),
+        )
+        .await;
+    } else {
+        drop(
+            ctl.dispatch(&format!(
+                "movetoworkspacesilent {},address:0x{address}",
+                pw.workspace
+            ))
+            .await,
+        );
+    }
 
     if restore_geometry
         && pw.floating
@@ -1909,6 +1923,7 @@ mod tests {
             position: None,
             size: None,
             rule_name: "hyprresume-slow-app".to_string(),
+            anchor: None,
         }];
         let all_rules = vec!["hyprresume-slow-app".to_string()];
 
@@ -1927,6 +1942,74 @@ mod tests {
             .iter()
             .any(|c| c.contains("windowrule[hyprresume-slow-app]:enable false"));
         assert!(has_rule_disable, "expected rule cleanup, got: {commands:?}");
+        drop(commands);
+
+        s1.abort();
+        s2.abort();
+    }
+
+    /// A late-appearing tiled window that was launched with a BSP anchor
+    /// must get the full float/focus-anchor/preselect/settle placement
+    /// dance, not just a bare `movetoworkspacesilent` — otherwise it lands
+    /// wherever Hyprland's own dwindle insertion defaults to instead of its
+    /// saved BSP slot next to its anchor sibling.
+    #[tokio::test]
+    async fn late_watcher_places_anchored_window_in_bsp_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock1 = dir.path().join("s1.sock");
+        let sock2 = dir.path().join("s2.sock");
+
+        let (mock1, log) = RecordingSocket1::new(&sock1);
+        let s1 = tokio::spawn(mock1.serve());
+
+        let s2 = spawn_delayed_socket2(
+            &sock2,
+            vec![(
+                Duration::from_millis(100),
+                "openwindow>>slack001,4,slack,Slack".to_string(),
+            )],
+        );
+
+        let paths = HyprSocketPaths::new(sock1, sock2);
+        let pending = vec![PendingWindow {
+            app_id: "slack".to_string(),
+            workspace: "4".to_string(),
+            floating: false,
+            fullscreen: false,
+            position: None,
+            size: None,
+            rule_name: "hyprresume-slack".to_string(),
+            anchor: Some(("anchor789".to_string(), dwindle::PreselDir::Bottom)),
+        }];
+        let all_rules = vec!["hyprresume-slack".to_string()];
+
+        watch_late_windows(paths, pending, all_rules, false, Duration::from_secs(5)).await;
+
+        let commands = log.lock().await;
+        assert!(
+            commands
+                .iter()
+                .any(|c| c.contains("movetoworkspacesilent 4,address:0xslack001")),
+            "expected workspace move, got: {commands:?}"
+        );
+        assert!(
+            commands
+                .iter()
+                .any(|c| c.contains("focuswindow address:0xanchor789")),
+            "expected focus on anchor sibling, got: {commands:?}"
+        );
+        assert!(
+            commands.iter().any(|c| c.contains("layoutmsg preselect d")),
+            "expected preselect against anchor, got: {commands:?}"
+        );
+        let float_count = commands
+            .iter()
+            .filter(|c| c.contains("setfloating address:0xslack001"))
+            .count();
+        assert_eq!(
+            float_count, 2,
+            "expected float + settle (2x setfloating), got: {commands:?}"
+        );
         drop(commands);
 
         s1.abort();
@@ -1961,6 +2044,7 @@ mod tests {
             position: None,
             size: None,
             rule_name: "hyprresume-missing-app".to_string(),
+            anchor: None,
         }];
         let all_rules = vec!["hyprresume-missing-app".to_string()];
 
@@ -2021,6 +2105,7 @@ mod tests {
             position: Some((200, 150)),
             size: Some((800, 600)),
             rule_name: "hyprresume-floater".to_string(),
+            anchor: None,
         }];
         let all_rules = vec!["hyprresume-floater".to_string()];
 
@@ -2087,6 +2172,7 @@ mod tests {
                 position: None,
                 size: None,
                 rule_name: "hyprresume-app-a".to_string(),
+                anchor: None,
             },
             PendingWindow {
                 app_id: "app-b".to_string(),
@@ -2096,6 +2182,7 @@ mod tests {
                 position: None,
                 size: None,
                 rule_name: "hyprresume-app-b".to_string(),
+                anchor: None,
             },
         ];
         let all_rules = vec![
