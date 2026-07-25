@@ -52,17 +52,46 @@ struct PendingWindow {
     rule_name: String,
 }
 
+/// Result of attempting to get a window onto the target workspace, one way
+/// or another.
+#[derive(Debug)]
+enum LaunchOutcome {
+    /// An already-live window (racing autostart) was claimed instead of
+    /// launching a duplicate.
+    Adopted(String),
+    /// The window was launched and its `OpenWindow` event observed normally.
+    Opened(String),
+    /// Nothing appeared in time; handed off to the late-window watcher.
+    Deferred,
+}
+
 /// Windows already live at daemon startup, available to be adopted in place
 /// of launching a duplicate. Only matters when the daemon restarts
 /// mid-session — Hyprland itself always starts with zero windows, so a real
 /// login/reboot leaves this pool empty and restore behaves as before.
 struct LiveWindowPool {
     windows: Vec<TrackedWindow>,
+    /// Addresses present in the daemon-startup snapshot, kept separately from
+    /// `windows` (which is drained by `take_match`) so a live re-query can
+    /// always tell "existed before this restore" apart from "appeared since".
+    known_at_startup: HashSet<String>,
+    /// Addresses already handed out by `take_match` or
+    /// `find_unclaimed_racing_window`, so the same live window is never
+    /// adopted twice.
+    claimed: HashSet<String>,
 }
 
 impl LiveWindowPool {
     fn new(windows: Vec<TrackedWindow>) -> Self {
-        Self { windows }
+        let known_at_startup = windows
+            .iter()
+            .map(|w| normalize_address(&w.address))
+            .collect();
+        Self {
+            windows,
+            known_at_startup,
+            claimed: HashSet::new(),
+        }
     }
 
     /// Find and remove the best-matching live window for a plan entry: same
@@ -78,7 +107,44 @@ impl LiveWindowPool {
             .filter(|(_, w)| w.app_id == entry.app_id && w.workspace == entry.workspace)
             .min_by_key(|(_, w)| position_distance_sq(w.position, entry.position))
             .map(|(i, _)| i)?;
-        Some(self.windows.remove(best))
+        let window = self.windows.remove(best);
+        self.claimed.insert(normalize_address(&window.address));
+        Some(window)
+    }
+
+    /// Re-query Hyprland's live clients right now for a window of `app_id`
+    /// that didn't exist at daemon startup and hasn't already been claimed.
+    /// Catches an app that opened independently sometime after the startup
+    /// snapshot was taken — an autostart entry can race ahead of, or during,
+    /// hyprresume's own restore sequence. Two failure modes this fixes:
+    /// the class's `OpenWindow` event arrived while a different window's
+    /// `wait_for_open_event` call was still draining events (and silently
+    /// discarded it, since that loop only keeps events matching its own
+    /// class), or the app is effectively single-instance and hyprresume's
+    /// own `exec` for it just activates the existing window without
+    /// emitting a fresh event at all — either way, no timeout duration would
+    /// let `wait_for_open_event` ever succeed for it.
+    ///
+    /// Deliberately does not filter by workspace like `take_match` does: the
+    /// whole point is to catch a window that hasn't been moved to its target
+    /// workspace yet (that's still the caller's job). This assumes any
+    /// matching live window that appeared since startup is this entry's
+    /// instance — the same heuristic `take_match` already relies on.
+    async fn find_unclaimed_racing_window(
+        &mut self,
+        ctl: &HyprCtl,
+        app_id: &str,
+    ) -> Option<String> {
+        let clients = ctl.get_clients().await.ok()?;
+        let matched = clients.into_iter().find(|c| {
+            c.class == app_id && {
+                let addr = normalize_address(&c.address);
+                !self.known_at_startup.contains(&addr) && !self.claimed.contains(&addr)
+            }
+        })?;
+        let addr = normalize_address(&matched.address);
+        self.claimed.insert(addr.clone());
+        Some(addr)
     }
 }
 
@@ -94,6 +160,7 @@ fn position_distance_sq(live: (i32, i32), saved: Option<(i32, i32)>) -> i64 {
 pub struct RestoreEngine {
     restore_geometry: bool,
     restore_layout: bool,
+    window_appear_timeout: Duration,
 }
 
 impl RestoreEngine {
@@ -101,7 +168,16 @@ impl RestoreEngine {
         Self {
             restore_geometry,
             restore_layout,
+            window_appear_timeout: WINDOW_APPEAR_TIMEOUT,
         }
+    }
+
+    /// Shorten the window-appear timeout so tests can exercise the
+    /// timeout-recheck path without a real 15s wait.
+    #[cfg(test)]
+    fn with_window_appear_timeout(mut self, timeout: Duration) -> Self {
+        self.window_appear_timeout = timeout;
+        self
     }
 
     pub async fn restore(
@@ -663,15 +739,22 @@ impl RestoreEngine {
                         pending,
                         &mut rule_counter,
                         anchor,
+                        live_pool,
                     )
                     .await
                 {
-                    Ok(Some(addr)) => {
+                    Ok(LaunchOutcome::Adopted(addr)) => {
+                        addresses.insert(step.window_idx, addr);
+                        adopted.insert(step.window_idx);
+                        report.restored += 1;
+                        tracing::info!("  adopted {} (racing autostart)", window.app_id);
+                    }
+                    Ok(LaunchOutcome::Opened(addr)) => {
                         addresses.insert(step.window_idx, addr);
                         report.restored += 1;
                         tracing::info!("  restored {}", window.app_id);
                     }
-                    Ok(None) => {
+                    Ok(LaunchOutcome::Deferred) => {
                         report.restored += 1;
                         tracing::info!("  launched {} (no window event)", window.app_id);
                     }
@@ -705,7 +788,21 @@ impl RestoreEngine {
         pending: &mut Vec<PendingWindow>,
         rule_counter: &mut usize,
         anchor: Option<(&str, dwindle::PreselDir)>,
-    ) -> Result<Option<String>> {
+        live_pool: &mut LiveWindowPool,
+    ) -> Result<LaunchOutcome> {
+        if let Some(addr) = live_pool
+            .find_unclaimed_racing_window(ctl, &window.app_id)
+            .await
+        {
+            tracing::info!(
+                "  {} already live before launch (racing autostart), adopting 0x{addr}",
+                window.app_id
+            );
+            self.place_window_in_bsp_slot(ctl, &addr, &window.workspace, anchor)
+                .await;
+            return Ok(LaunchOutcome::Adopted(addr));
+        }
+
         let rule_name = format!(
             "hyprresume-{}-{}",
             window.app_id.replace(['.', ' '], "-"),
@@ -748,12 +845,24 @@ impl RestoreEngine {
                     anchor,
                 )
                 .await;
-            Ok(Some(final_addr))
+            Ok(LaunchOutcome::Opened(final_addr))
+        } else if let Some(addr) = live_pool
+            .find_unclaimed_racing_window(ctl, &window.app_id)
+            .await
+        {
+            tracing::info!(
+                "  {} appeared via racing autostart while waiting, adopting 0x{addr} instead of deferring",
+                window.app_id
+            );
+            disable_all_rules(ctl, &[rule_name]).await;
+            self.place_window_in_bsp_slot(ctl, &addr, &window.workspace, anchor)
+                .await;
+            Ok(LaunchOutcome::Adopted(addr))
         } else {
             tracing::warn!(
                 "{} did not appear within {}s, deferring to late-window watcher",
                 window.app_id,
-                WINDOW_APPEAR_TIMEOUT.as_secs()
+                self.window_appear_timeout.as_secs()
             );
             active_rules.push(rule_name.clone());
             pending.push(PendingWindow {
@@ -765,7 +874,7 @@ impl RestoreEngine {
                 size: window.size,
                 rule_name,
             });
-            Ok(None)
+            Ok(LaunchOutcome::Deferred)
         }
     }
 
@@ -821,29 +930,57 @@ impl RestoreEngine {
             tracing::debug!("retile: close stale ok");
         }
 
+        self.place_window_in_bsp_slot(ctl, &real_addr, workspace, anchor)
+            .await;
+
+        real_addr
+    }
+
+    /// Move an already-live window into its BSP-tree slot: workspace, then
+    /// float it out and settle it back in, preselecting against `anchor`
+    /// (focused and preselected as the very last step before settling)
+    /// if one is given. Used both for a splash window's real successor
+    /// (`retile_superseding_window`) and for a window adopted mid-restore
+    /// because it raced ahead of its own launch step (an autostart entry
+    /// that was already running by the time hyprresume got to it).
+    ///
+    /// Preselect must be issued immediately before the floating->tiled
+    /// transition that consumes it — issuing it earlier risks it being
+    /// cleared by an intervening tiling-state change, which is exactly what
+    /// caused a live-tested regression (see `retile_superseding_window`'s
+    /// doc comment for the full story). Deliberately does NOT re-focus
+    /// `addr` right before the final settle: refocusing there breaks the
+    /// preselect binding set up above.
+    async fn place_window_in_bsp_slot(
+        &self,
+        ctl: &HyprCtl,
+        addr: &str,
+        workspace: &str,
+        anchor: Option<(&str, dwindle::PreselDir)>,
+    ) {
         if ctl
             .dispatch(&format!(
-                "movetoworkspacesilent {workspace},address:0x{real_addr}"
+                "movetoworkspacesilent {workspace},address:0x{addr}"
             ))
             .await
             .is_ok()
         {
-            tracing::debug!("retile: move to workspace ok");
+            tracing::debug!("place: move to workspace ok");
         }
 
         if ctl
-            .dispatch(&format!("focuswindow address:0x{real_addr}"))
+            .dispatch(&format!("focuswindow address:0x{addr}"))
             .await
             .is_ok()
         {
-            tracing::debug!("retile: focus real ok");
+            tracing::debug!("place: focus ok");
         }
         if ctl
-            .dispatch(&format!("setfloating address:0x{real_addr}"))
+            .dispatch(&format!("setfloating address:0x{addr}"))
             .await
             .is_ok()
         {
-            tracing::debug!("retile: float ok");
+            tracing::debug!("place: float ok");
         }
 
         if let Some((anchor_addr, presel)) = anchor {
@@ -852,34 +989,24 @@ impl RestoreEngine {
                 .await
                 .is_ok()
             {
-                tracing::debug!("retile: focus anchor ok");
+                tracing::debug!("place: focus anchor ok");
             }
             if ctl
                 .dispatch(&format!("layoutmsg preselect {presel}"))
                 .await
                 .is_ok()
             {
-                tracing::debug!("retile: preselect ok");
+                tracing::debug!("place: preselect ok");
             }
         }
 
-        // Deliberately do NOT re-focus real_addr here before settling it.
-        // setfloating targets real_addr directly by address, so refocusing
-        // isn't needed to target it — and live-testing showed that doing so
-        // breaks the preselect binding set up above (Hyprland appears to tie
-        // the pending preselect to whatever is focused when the floating->
-        // tiled transition happens, so shifting focus away from the anchor
-        // right before settling re-inserts the window in the wrong place,
-        // e.g. next to whatever was previously active instead of the anchor).
         if ctl
-            .dispatch(&format!("setfloating address:0x{real_addr}"))
+            .dispatch(&format!("setfloating address:0x{addr}"))
             .await
             .is_ok()
         {
-            tracing::debug!("retile: settile ok");
+            tracing::debug!("place: settle ok");
         }
-
-        real_addr
     }
 
     /// Apply `layoutmsg splitratio <delta>` for each split node in the BSP tree
@@ -1064,7 +1191,26 @@ impl RestoreEngine {
         events: &mut mpsc::Receiver<HyprEvent>,
         active_rules: &mut Vec<String>,
         pending: &mut Vec<PendingWindow>,
-    ) -> Result<Option<String>> {
+        live_pool: &mut LiveWindowPool,
+    ) -> Result<LaunchOutcome> {
+        if let Some(addr) = live_pool
+            .find_unclaimed_racing_window(ctl, &window.app_id)
+            .await
+        {
+            tracing::info!(
+                "  {} already live before launch (racing autostart), adopting 0x{addr}",
+                window.app_id
+            );
+            drop(
+                ctl.dispatch(&format!(
+                    "movetoworkspacesilent {},address:0x{addr}",
+                    window.workspace
+                ))
+                .await,
+            );
+            return Ok(LaunchOutcome::Adopted(addr));
+        }
+
         let rule_name = format!(
             "hyprresume-{}-{}",
             window.app_id.replace(['.', ' '], "-"),
@@ -1100,12 +1246,29 @@ impl RestoreEngine {
                 ))
                 .await,
             );
-            Ok(Some(addr.clone()))
+            Ok(LaunchOutcome::Opened(addr.clone()))
+        } else if let Some(addr) = live_pool
+            .find_unclaimed_racing_window(ctl, &window.app_id)
+            .await
+        {
+            tracing::info!(
+                "  {} appeared via racing autostart while waiting, adopting 0x{addr} instead of deferring",
+                window.app_id
+            );
+            disable_all_rules(ctl, &[rule_name]).await;
+            drop(
+                ctl.dispatch(&format!(
+                    "movetoworkspacesilent {},address:0x{addr}",
+                    window.workspace
+                ))
+                .await,
+            );
+            Ok(LaunchOutcome::Adopted(addr))
         } else {
             tracing::warn!(
                 "{} did not appear within {}s, deferring to late-window watcher",
                 window.app_id,
-                WINDOW_APPEAR_TIMEOUT.as_secs()
+                self.window_appear_timeout.as_secs()
             );
             active_rules.push(rule_name.clone());
             pending.push(PendingWindow {
@@ -1117,7 +1280,7 @@ impl RestoreEngine {
                 size: window.size,
                 rule_name,
             });
-            Ok(None)
+            Ok(LaunchOutcome::Deferred)
         }
     }
 
@@ -1142,12 +1305,17 @@ impl RestoreEngine {
             return Ok(true);
         }
 
-        let addr = self
-            .launch_and_track(window, ctl, events, active_rules, pending)
+        let outcome = self
+            .launch_and_track(window, ctl, events, active_rules, pending, live_pool)
             .await?;
 
-        let Some(addr) = addr else {
-            return Ok(false);
+        let addr = match outcome {
+            LaunchOutcome::Adopted(addr) => {
+                tracing::info!("  adopted {} (racing autostart, 0x{addr})", window.app_id);
+                return Ok(true);
+            }
+            LaunchOutcome::Opened(addr) => addr,
+            LaunchOutcome::Deferred => return Ok(false),
         };
 
         if self.restore_geometry {
@@ -1176,7 +1344,7 @@ impl RestoreEngine {
         events: &mut mpsc::Receiver<HyprEvent>,
         app_id: &str,
     ) -> Option<String> {
-        self.wait_for_open_event_within(events, app_id, WINDOW_APPEAR_TIMEOUT)
+        self.wait_for_open_event_within(events, app_id, self.window_appear_timeout)
             .await
     }
 
@@ -1473,22 +1641,39 @@ mod tests {
     use tokio::net::UnixListener;
     use tokio::sync::Mutex;
 
-    /// Mock socket1 that records all received IPC commands and responds "ok".
+    /// Shared handle to a `RecordingSocket1`'s `j/clients` response, mutable
+    /// so a test can simulate a window appearing live partway through.
+    type ClientsJsonHandle = Arc<Mutex<String>>;
+
+    /// Mock socket1 that records all received IPC commands, responds "ok" to
+    /// everything except `j/clients` queries, which get `clients_json`.
     struct RecordingSocket1 {
         listener: UnixListener,
         log: Arc<Mutex<Vec<String>>>,
+        clients_json: ClientsJsonHandle,
     }
 
     impl RecordingSocket1 {
         fn new(path: &std::path::Path) -> (Self, Arc<Mutex<Vec<String>>>) {
+            let (me, log, _clients) = Self::with_clients(path, "[]".to_string());
+            (me, log)
+        }
+
+        fn with_clients(
+            path: &std::path::Path,
+            clients_json: String,
+        ) -> (Self, Arc<Mutex<Vec<String>>>, ClientsJsonHandle) {
             let listener = UnixListener::bind(path).unwrap();
             let log = Arc::new(Mutex::new(Vec::new()));
+            let clients_json = Arc::new(Mutex::new(clients_json));
             (
                 Self {
                     listener,
                     log: log.clone(),
+                    clients_json: clients_json.clone(),
                 },
                 log,
+                clients_json,
             )
         }
 
@@ -1498,14 +1683,29 @@ mod tests {
                     break;
                 };
                 let log = self.log.clone();
+                let clients_json = self.clients_json.clone();
                 tokio::spawn(async move {
                     let mut buf = String::new();
                     drop(stream.read_to_string(&mut buf).await);
-                    log.lock().await.push(buf);
-                    drop(stream.write_all(b"ok").await);
+                    log.lock().await.push(buf.clone());
+                    let response = if buf.contains("j/clients") {
+                        clients_json.lock().await.clone()
+                    } else {
+                        "ok".to_string()
+                    };
+                    drop(stream.write_all(response.as_bytes()).await);
                 });
             }
         }
+    }
+
+    /// Minimal `hyprctl clients -j`-shaped JSON for a single live window.
+    fn single_client_json(address: &str, class: &str, workspace: &str) -> String {
+        format!(
+            r#"[{{"address":"{address}","class":"{class}","pid":1,
+            "workspace":{{"id":1,"name":"{workspace}"}},"monitor":0,
+            "at":[0,0],"size":[800,600],"floating":false,"fullscreen":0}}]"#
+        )
     }
 
     /// Bind a socket2 listener (synchronously creates the file) and spawn
@@ -2449,6 +2649,392 @@ mod tests {
                 .iter()
                 .any(|c| c.contains("fullscreen 0,address:0xfresh03")),
             "freshly-launched fullscreen window must still be toggled, got: {commands:?}"
+        );
+        drop(commands);
+
+        s1.abort();
+    }
+
+    // --- LiveWindowPool::find_unclaimed_racing_window ---
+
+    /// A window that appeared sometime after the daemon-startup snapshot
+    /// (i.e. not in `known_at_startup`) is a valid racing-autostart match.
+    #[tokio::test]
+    async fn find_unclaimed_racing_window_matches_new_live_client() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock1 = dir.path().join("s1.sock");
+        let sock2 = dir.path().join("s2.sock");
+
+        let (mock1, _log, _clients) =
+            RecordingSocket1::with_clients(&sock1, single_client_json("0xslack1", "slack", "1"));
+        let s1 = tokio::spawn(mock1.serve());
+
+        let ctl = HyprCtl::new(HyprSocketPaths::new(sock1, sock2));
+        let mut pool = LiveWindowPool::new(vec![]);
+
+        let addr = pool.find_unclaimed_racing_window(&ctl, "slack").await;
+        assert_eq!(addr, Some("slack1".to_string()));
+
+        s1.abort();
+    }
+
+    /// A window already present at daemon startup must be left alone here —
+    /// it's `take_match`'s job, keyed on workspace + saved position, not
+    /// this method's (which deliberately ignores workspace).
+    #[tokio::test]
+    async fn find_unclaimed_racing_window_ignores_known_at_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock1 = dir.path().join("s1.sock");
+        let sock2 = dir.path().join("s2.sock");
+
+        let (mock1, _log, _clients) =
+            RecordingSocket1::with_clients(&sock1, single_client_json("0xslack1", "slack", "1"));
+        let s1 = tokio::spawn(mock1.serve());
+
+        let ctl = HyprCtl::new(HyprSocketPaths::new(sock1, sock2));
+        let mut pool = LiveWindowPool::new(vec![make_tracked("0xslack1", "slack", "1", (0, 0))]);
+
+        let addr = pool.find_unclaimed_racing_window(&ctl, "slack").await;
+        assert!(
+            addr.is_none(),
+            "a window present at daemon startup must not be claimed by the racing-window check"
+        );
+
+        s1.abort();
+    }
+
+    /// The same live window must never be handed out twice.
+    #[tokio::test]
+    async fn find_unclaimed_racing_window_does_not_double_claim() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock1 = dir.path().join("s1.sock");
+        let sock2 = dir.path().join("s2.sock");
+
+        let (mock1, _log, _clients) =
+            RecordingSocket1::with_clients(&sock1, single_client_json("0xslack1", "slack", "1"));
+        let s1 = tokio::spawn(mock1.serve());
+
+        let ctl = HyprCtl::new(HyprSocketPaths::new(sock1, sock2));
+        let mut pool = LiveWindowPool::new(vec![]);
+
+        assert!(
+            pool.find_unclaimed_racing_window(&ctl, "slack")
+                .await
+                .is_some()
+        );
+        assert!(
+            pool.find_unclaimed_racing_window(&ctl, "slack")
+                .await
+                .is_none(),
+            "the same live window must not be claimed twice"
+        );
+
+        s1.abort();
+    }
+
+    // --- racing-autostart adoption in bsp_launch_and_track ---
+
+    /// If the app is already live (racing autostart) before hyprresume even
+    /// attempts to launch it, adopt it directly: no window rule, no `exec`.
+    #[tokio::test]
+    async fn bsp_launch_and_track_adopts_racing_window_before_exec() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock1 = dir.path().join("s1.sock");
+        let sock2 = dir.path().join("s2.sock");
+
+        let (mock1, log, _clients) =
+            RecordingSocket1::with_clients(&sock1, single_client_json("0xslack1", "slack", "1"));
+        let s1 = tokio::spawn(mock1.serve());
+
+        let ctl = HyprCtl::new(HyprSocketPaths::new(sock1, sock2));
+        let engine = RestoreEngine::new(true, true);
+        let (_tx, mut events) = mpsc::channel::<HyprEvent>(8);
+
+        let window = make_entry("slack", "slack", None, None);
+        let mut active_rules = Vec::new();
+        let mut pending = Vec::new();
+        let mut rule_counter = 0usize;
+        let mut live_pool = LiveWindowPool::new(vec![]);
+
+        let outcome = engine
+            .bsp_launch_and_track(
+                &window,
+                &ctl,
+                &mut events,
+                &mut active_rules,
+                &mut pending,
+                &mut rule_counter,
+                None,
+                &mut live_pool,
+            )
+            .await
+            .unwrap();
+
+        match outcome {
+            LaunchOutcome::Adopted(addr) => assert_eq!(addr, "slack1"),
+            other => panic!("expected LaunchOutcome::Adopted, got {other:?}"),
+        }
+        assert!(
+            active_rules.is_empty(),
+            "no window rule should be created when adopting before launch"
+        );
+        assert!(pending.is_empty(), "nothing should be deferred");
+
+        let commands = log.lock().await;
+        assert!(
+            !commands.iter().any(|c| c.contains("exec")),
+            "must not launch a duplicate when a racing window is already live, got: {commands:?}"
+        );
+        assert!(
+            commands
+                .iter()
+                .any(|c| c.contains("movetoworkspacesilent 1,address:0xslack1")),
+            "expected the adopted window to be moved onto its target workspace, got: {commands:?}"
+        );
+        drop(commands);
+
+        s1.abort();
+    }
+
+    /// If the racing window doesn't show up in time for the pre-exec check,
+    /// but is live by the time `wait_for_open_event` times out, the timeout
+    /// path must re-check and adopt it instead of deferring to the
+    /// late-window watcher.
+    #[tokio::test]
+    async fn bsp_launch_and_track_adopts_racing_window_after_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock1 = dir.path().join("s1.sock");
+        let sock2 = dir.path().join("s2.sock");
+
+        let (mock1, log, clients_handle) = RecordingSocket1::with_clients(&sock1, "[]".to_string());
+        let s1 = tokio::spawn(mock1.serve());
+
+        let handle = clients_handle.clone();
+        let updater = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            *handle.lock().await = single_client_json("0xslack1", "slack", "1");
+        });
+
+        let ctl = HyprCtl::new(HyprSocketPaths::new(sock1, sock2));
+        let engine =
+            RestoreEngine::new(true, true).with_window_appear_timeout(Duration::from_millis(80));
+        let (_tx, mut events) = mpsc::channel::<HyprEvent>(8);
+
+        let window = make_entry("slack", "slack", None, None);
+        let mut active_rules = Vec::new();
+        let mut pending = Vec::new();
+        let mut rule_counter = 0usize;
+        let mut live_pool = LiveWindowPool::new(vec![]);
+
+        let outcome = engine
+            .bsp_launch_and_track(
+                &window,
+                &ctl,
+                &mut events,
+                &mut active_rules,
+                &mut pending,
+                &mut rule_counter,
+                None,
+                &mut live_pool,
+            )
+            .await
+            .unwrap();
+
+        match outcome {
+            LaunchOutcome::Adopted(addr) => assert_eq!(addr, "slack1"),
+            other => panic!("expected LaunchOutcome::Adopted after timeout-recheck, got {other:?}"),
+        }
+        assert!(
+            pending.is_empty(),
+            "must not defer to the late-window watcher once adopted, got {} pending",
+            pending.len()
+        );
+
+        let commands = log.lock().await;
+        assert!(
+            commands.iter().any(|c| c.contains("exec slack")),
+            "expected the normal launch attempt to have fired first, got: {commands:?}"
+        );
+        assert!(
+            commands.iter().any(|c| c.contains(":enable false")),
+            "expected the now-unused window rule to be disabled, got: {commands:?}"
+        );
+        drop(commands);
+
+        s1.abort();
+        updater.abort();
+    }
+
+    // --- racing-autostart adoption composed with execute_bsp_plans ---
+
+    /// A racing-adopted window must land in `adopted` (so downstream
+    /// convergence/splitratio/fullscreen steps skip it, same as a
+    /// startup-pool adoption) and later steps must anchor against its
+    /// address, exactly like a freshly-launched window would.
+    #[tokio::test]
+    async fn execute_bsp_plans_adopts_racing_window_and_anchors_next_step() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock1 = dir.path().join("s1.sock");
+        let sock2 = dir.path().join("s2.sock");
+
+        // Slack raced onto workspace 9 (Hyprland's default placement for an
+        // independent autostart), not workspace 4 where the plan wants it —
+        // mirroring the real bug, where the racing window is never on its
+        // target workspace yet.
+        let (mock1, log, _clients) =
+            RecordingSocket1::with_clients(&sock1, single_client_json("0xslack1", "slack", "9"));
+        let s1 = tokio::spawn(mock1.serve());
+
+        let ctl = HyprCtl::new(HyprSocketPaths::new(sock1, sock2));
+        let engine = RestoreEngine::new(false, true);
+
+        let (event_tx, mut events) = mpsc::channel::<HyprEvent>(8);
+        event_tx
+            .send(HyprEvent::OpenWindow {
+                address: "discordwin".to_string(),
+                workspace: "4".to_string(),
+                class: "discord".to_string(),
+            })
+            .await
+            .unwrap();
+
+        let session = SessionFile {
+            session: crate::models::SessionMeta {
+                name: "t".to_string(),
+                timestamp: 0,
+            },
+            windows: vec![
+                entry_with_position("slack", "4", (0, 0)),
+                entry_with_position("discord", "4", (500, 0)),
+            ],
+        };
+
+        let mut ws_plans = HashMap::new();
+        ws_plans.insert(
+            "4".to_string(),
+            DwindlePlan {
+                steps: vec![
+                    dwindle::RestoreStep {
+                        window_idx: 0,
+                        focus_idx: None,
+                        preselect: None,
+                    },
+                    dwindle::RestoreStep {
+                        window_idx: 1,
+                        focus_idx: Some(0),
+                        preselect: Some(dwindle::PreselDir::Right),
+                    },
+                ],
+                ratio_steps: vec![],
+            },
+        );
+
+        let mut report = RestoreReport::default();
+        let mut active_rules = Vec::new();
+        let mut pending = Vec::new();
+        let mut live_pool = LiveWindowPool::new(vec![]);
+
+        let (addresses, adopted) = engine
+            .execute_bsp_plans(
+                &session,
+                &ctl,
+                &mut events,
+                &mut report,
+                &ws_plans,
+                &mut active_rules,
+                &mut pending,
+                &mut live_pool,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(report.restored, 2);
+        assert_eq!(addresses.get(&0), Some(&"slack1".to_string()));
+        assert_eq!(addresses.get(&1), Some(&"discordwin".to_string()));
+        assert!(
+            adopted.contains(&0),
+            "slack should have been adopted via the racing-autostart check"
+        );
+        assert!(
+            !adopted.contains(&1),
+            "discord was freshly launched, not adopted"
+        );
+
+        let commands = log.lock().await;
+        assert!(
+            !commands.iter().any(|c| c.contains("exec slack")),
+            "must not launch slack, it was already racing-live, got: {commands:?}"
+        );
+        assert!(
+            commands
+                .iter()
+                .any(|c| c.contains("movetoworkspacesilent 4,address:0xslack1")),
+            "expected slack to be moved onto its target workspace, got: {commands:?}"
+        );
+        assert!(
+            commands
+                .iter()
+                .any(|c| c.contains("focuswindow address:0xslack1")),
+            "expected discord's step to anchor against the adopted slack window, got: {commands:?}"
+        );
+        assert!(
+            commands.iter().any(|c| c.contains("layoutmsg preselect r")),
+            "expected preselect for discord's step, got: {commands:?}"
+        );
+        drop(commands);
+
+        s1.abort();
+    }
+
+    // --- racing-autostart adoption in launch_and_track / restore_window ---
+
+    /// The simple (non-BSP) restore path must also adopt a racing-live
+    /// window instead of launching a duplicate.
+    #[tokio::test]
+    async fn restore_window_adopts_racing_window_before_exec() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock1 = dir.path().join("s1.sock");
+        let sock2 = dir.path().join("s2.sock");
+
+        let (mock1, log, _clients) =
+            RecordingSocket1::with_clients(&sock1, single_client_json("0xfoot9", "foot", "1"));
+        let s1 = tokio::spawn(mock1.serve());
+
+        let ctl = HyprCtl::new(HyprSocketPaths::new(sock1, sock2));
+        let engine = RestoreEngine::new(true, true);
+        let (_tx, mut events) = mpsc::channel::<HyprEvent>(8);
+
+        let mut active_rules = Vec::new();
+        let mut pending = Vec::new();
+        let mut live_pool = LiveWindowPool::new(vec![]);
+        let window = make_entry("foot", "foot", None, None);
+
+        let adopted = engine
+            .restore_window(
+                &window,
+                &ctl,
+                &mut events,
+                &mut active_rules,
+                &mut pending,
+                &mut live_pool,
+            )
+            .await
+            .unwrap();
+
+        assert!(adopted, "expected the racing-live window to be adopted");
+        assert!(active_rules.is_empty());
+        assert!(pending.is_empty());
+
+        let commands = log.lock().await;
+        assert!(
+            !commands.iter().any(|c| c.contains("exec")),
+            "must not launch a duplicate, got: {commands:?}"
+        );
+        assert!(
+            commands
+                .iter()
+                .any(|c| c.contains("movetoworkspacesilent 1,address:0xfoot9")),
+            "expected workspace placement, got: {commands:?}"
         );
         drop(commands);
 
