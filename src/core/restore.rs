@@ -40,8 +40,6 @@ const SINGLE_INSTANCE_FLAGS: &[&str] = &["--gtk-single-instance=true", "--single
 
 /// A window that was launched but didn't appear within the per-window timeout.
 /// Handed off to the background watcher for deferred placement.
-/// A window that was launched but didn't appear within the per-window timeout.
-/// Handed off to the background watcher for deferred placement.
 struct PendingWindow {
     app_id: String,
     workspace: String,
@@ -50,10 +48,44 @@ struct PendingWindow {
     position: Option<(i32, i32)>,
     size: Option<(i32, i32)>,
     rule_name: String,
-    /// BSP-tree anchor sibling and preselect direction known at plan time, if
-    /// any. Owned (not borrowed like the `anchor` param used elsewhere)
-    /// because it's moved into the spawned `watch_late_windows` task.
-    anchor: Option<(String, dwindle::PreselDir)>,
+    /// How to finalize this window's placement once it actually appears,
+    /// known at plan time. Owned (not borrowed like the params used
+    /// elsewhere) because it's moved into the spawned `watch_late_windows`
+    /// task.
+    placement: PlacementHint,
+}
+
+/// How a late-appearing window should be finalized once it's handed off
+/// from the main restore loop to the background watcher. Dwindle and
+/// master placement are structurally different (BSP anchor/preselect vs.
+/// master/stack promotion), so this is a variant per layout rather than
+/// overloading one field with a shape that only makes sense for one of them.
+#[derive(Debug, Clone)]
+enum PlacementHint {
+    /// No special finalization beyond landing on the workspace — stack
+    /// windows, the first master window, floating windows, and dwindle
+    /// windows with no anchor.
+    None,
+    /// BSP-tree anchor sibling and preselect direction known at plan time.
+    DwindleAnchor(String, dwindle::PreselDir),
+    /// Promote to the master slot once placed (an "extra master" window
+    /// under the master layout, beyond the first).
+    MasterPromote,
+}
+
+/// Which role a window plays in a master-layout restore, if any. Governs
+/// both whether the splash-supersede grace-period wait applies and whether
+/// the window gets promoted to master once placed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MasterRole {
+    /// Not part of a master-layout restore (floating, fallback) — no
+    /// splash-supersede check, no promotion.
+    None,
+    /// Master layout, but no promotion needed (the first master window, or
+    /// a stack window) — still gets the splash-supersede check.
+    Plain,
+    /// Master layout, needs `layoutmsg addmaster` once placed.
+    Promote,
 }
 
 /// Result of attempting to get a window onto the target workspace, one way
@@ -329,7 +361,15 @@ impl RestoreEngine {
             );
 
             match self
-                .restore_window(window, ctl, events, active_rules, pending, live_pool)
+                .restore_window(
+                    window,
+                    ctl,
+                    events,
+                    active_rules,
+                    pending,
+                    live_pool,
+                    MasterRole::None,
+                )
                 .await
             {
                 Ok(_) => {
@@ -522,7 +562,15 @@ impl RestoreEngine {
                 let window = &session.windows[first_idx];
                 tracing::info!("[master] opening master: {}", window.app_id);
                 match self
-                    .restore_window(window, ctl, events, active_rules, pending, live_pool)
+                    .restore_window(
+                        window,
+                        ctl,
+                        events,
+                        active_rules,
+                        pending,
+                        live_pool,
+                        MasterRole::Plain,
+                    )
                     .await
                 {
                     Ok(_) => report.restored += 1,
@@ -533,23 +581,30 @@ impl RestoreEngine {
                 }
             }
 
-            // Open additional master windows and promote them. Skipped for
-            // adopted windows: an already-live window is already in its
-            // correct slot, and addmaster would instead promote whatever
-            // happens to be focused.
+            // Open additional master windows and promote them. Promotion is
+            // handled inside restore_window/launch_and_track (gated on
+            // MasterRole::Promote), which skips it for adopted windows: an
+            // already-live window is already in its correct slot, and
+            // addmaster would instead promote whatever happens to be
+            // focused. A window that times out gets the promotion deferred
+            // to the late-window watcher instead of firing immediately here
+            // against whatever's currently focused.
             for &idx in plan.master_indices.iter().skip(1) {
                 let window = &session.windows[idx];
                 tracing::info!("[master] opening extra master: {}", window.app_id);
                 match self
-                    .restore_window(window, ctl, events, active_rules, pending, live_pool)
+                    .restore_window(
+                        window,
+                        ctl,
+                        events,
+                        active_rules,
+                        pending,
+                        live_pool,
+                        MasterRole::Promote,
+                    )
                     .await
                 {
-                    Ok(adopted) => {
-                        report.restored += 1;
-                        if !adopted {
-                            drop(ctl.dispatch("layoutmsg addmaster").await);
-                        }
-                    }
+                    Ok(_) => report.restored += 1,
                     Err(e) => {
                         report.failed += 1;
                         report.errors.push((window.app_id.clone(), e.to_string()));
@@ -562,7 +617,15 @@ impl RestoreEngine {
                 let window = &session.windows[idx];
                 tracing::info!("[master] opening stack: {}", window.app_id);
                 match self
-                    .restore_window(window, ctl, events, active_rules, pending, live_pool)
+                    .restore_window(
+                        window,
+                        ctl,
+                        events,
+                        active_rules,
+                        pending,
+                        live_pool,
+                        MasterRole::Plain,
+                    )
                     .await
                 {
                     Ok(_) => report.restored += 1,
@@ -896,7 +959,10 @@ impl RestoreEngine {
                 position: window.position,
                 size: window.size,
                 rule_name,
-                anchor: anchor.map(|(addr, presel)| (addr.to_string(), presel)),
+                placement: match anchor {
+                    Some((addr, presel)) => PlacementHint::DwindleAnchor(addr.to_string(), presel),
+                    None => PlacementHint::None,
+                },
             });
             Ok(LaunchOutcome::Deferred)
         }
@@ -936,7 +1002,32 @@ impl RestoreEngine {
         workspace: &str,
         anchor: Option<(&str, dwindle::PreselDir)>,
     ) -> String {
-        let final_addr = if let Some(real_addr) = self
+        let final_addr = self
+            .resolve_splash_supersede(ctl, events, first_addr, class)
+            .await;
+
+        place_window_in_bsp_slot(ctl, &final_addr, workspace, anchor).await;
+
+        final_addr
+    }
+
+    /// Wait briefly to see if a second window of the same class shows up
+    /// after the first — some apps (observed: Discord) open a transient
+    /// splash window before their real main window, both sharing the same
+    /// class. If a second window appears within the grace period, the first
+    /// is a stale splash: close it and report the real window's address
+    /// instead. Shared between the dwindle and master paths, which each
+    /// finalize placement differently afterwards (`place_window_in_bsp_slot`
+    /// vs. `layoutmsg addmaster`/stack ordering) — this only resolves which
+    /// address is the real one to place.
+    async fn resolve_splash_supersede(
+        &self,
+        ctl: &HyprCtl,
+        events: &mut mpsc::Receiver<HyprEvent>,
+        first_addr: &str,
+        class: &str,
+    ) -> String {
+        if let Some(real_addr) = self
             .wait_for_open_event_within(events, class, RETILE_GRACE_PERIOD)
             .await
         {
@@ -953,11 +1044,7 @@ impl RestoreEngine {
             real_addr
         } else {
             first_addr.to_string()
-        };
-
-        place_window_in_bsp_slot(ctl, &final_addr, workspace, anchor).await;
-
-        final_addr
+        }
     }
 
     /// Apply `layoutmsg splitratio <delta>` for each split node in the BSP tree
@@ -1172,7 +1259,15 @@ impl RestoreEngine {
                 window.workspace
             );
             match self
-                .restore_window(window, ctl, events, active_rules, pending, live_pool)
+                .restore_window(
+                    window,
+                    ctl,
+                    events,
+                    active_rules,
+                    pending,
+                    live_pool,
+                    MasterRole::None,
+                )
                 .await
             {
                 Ok(_) => report.restored += 1,
@@ -1192,6 +1287,7 @@ impl RestoreEngine {
     /// subsequent window of the same class never sees a stale rule. Only
     /// rules for timed-out windows are kept alive (pushed to `active_rules`)
     /// for the background late-window watcher.
+    #[allow(clippy::too_many_arguments)]
     async fn launch_and_track(
         &self,
         window: &WindowEntry,
@@ -1200,6 +1296,7 @@ impl RestoreEngine {
         active_rules: &mut Vec<String>,
         pending: &mut Vec<PendingWindow>,
         live_pool: &mut LiveWindowPool,
+        master_role: MasterRole,
     ) -> Result<LaunchOutcome> {
         if let Some(addr) = live_pool
             .find_unclaimed_racing_window(ctl, &window.app_id)
@@ -1247,15 +1344,26 @@ impl RestoreEngine {
         if let Some(ref addr) = self.wait_for_open_event(events, &window.app_id).await {
             tracing::debug!("  {} appeared at 0x{addr}", window.app_id);
             disable_all_rules(ctl, &[rule_name]).await;
+
+            let final_addr = if master_role == MasterRole::None {
+                addr.clone()
+            } else {
+                self.resolve_splash_supersede(ctl, events, addr, &window.app_id)
+                    .await
+            };
+
             drop(
                 ctl.dispatch(&format!(
-                    "movetoworkspacesilent {},address:0x{addr}",
+                    "movetoworkspacesilent {},address:0x{final_addr}",
                     window.workspace
                 ))
                 .await,
             );
-            live_pool.mark_claimed(addr);
-            Ok(LaunchOutcome::Opened(addr.clone()))
+            if master_role == MasterRole::Promote {
+                drop(ctl.dispatch("layoutmsg addmaster").await);
+            }
+            live_pool.mark_claimed(&final_addr);
+            Ok(LaunchOutcome::Opened(final_addr))
         } else if let Some(addr) = live_pool
             .find_unclaimed_racing_window(ctl, &window.app_id)
             .await
@@ -1288,7 +1396,11 @@ impl RestoreEngine {
                 position: window.position,
                 size: window.size,
                 rule_name,
-                anchor: None,
+                placement: if master_role == MasterRole::Promote {
+                    PlacementHint::MasterPromote
+                } else {
+                    PlacementHint::None
+                },
             });
             Ok(LaunchOutcome::Deferred)
         }
@@ -1297,6 +1409,7 @@ impl RestoreEngine {
     /// Restore a single window. Returns `Ok(true)` if an already-live window
     /// was adopted instead of launching a duplicate, `Ok(false)` otherwise
     /// (freshly launched, or deferred to the late-window watcher).
+    #[allow(clippy::too_many_arguments)]
     async fn restore_window(
         &self,
         window: &WindowEntry,
@@ -1305,6 +1418,7 @@ impl RestoreEngine {
         active_rules: &mut Vec<String>,
         pending: &mut Vec<PendingWindow>,
         live_pool: &mut LiveWindowPool,
+        master_role: MasterRole,
     ) -> Result<bool> {
         if let Some(live) = live_pool.take_match(window) {
             tracing::info!(
@@ -1316,7 +1430,15 @@ impl RestoreEngine {
         }
 
         let outcome = self
-            .launch_and_track(window, ctl, events, active_rules, pending, live_pool)
+            .launch_and_track(
+                window,
+                ctl,
+                events,
+                active_rules,
+                pending,
+                live_pool,
+                master_role,
+            )
             .await?;
 
         let addr = match outcome {
@@ -1541,24 +1663,35 @@ async fn apply_late_window(
     address: &str,
     restore_geometry: bool,
 ) {
-    if !pw.floating
-        && let Some((anchor_addr, presel)) = &pw.anchor
-    {
-        place_window_in_bsp_slot(
-            ctl,
-            address,
-            &pw.workspace,
-            Some((anchor_addr.as_str(), *presel)),
-        )
-        .await;
-    } else {
-        drop(
-            ctl.dispatch(&format!(
-                "movetoworkspacesilent {},address:0x{address}",
-                pw.workspace
-            ))
-            .await,
-        );
+    match (&pw.placement, pw.floating) {
+        (PlacementHint::DwindleAnchor(anchor_addr, presel), false) => {
+            place_window_in_bsp_slot(
+                ctl,
+                address,
+                &pw.workspace,
+                Some((anchor_addr.as_str(), *presel)),
+            )
+            .await;
+        }
+        (PlacementHint::MasterPromote, false) => {
+            drop(
+                ctl.dispatch(&format!(
+                    "movetoworkspacesilent {},address:0x{address}",
+                    pw.workspace
+                ))
+                .await,
+            );
+            drop(ctl.dispatch("layoutmsg addmaster").await);
+        }
+        _ => {
+            drop(
+                ctl.dispatch(&format!(
+                    "movetoworkspacesilent {},address:0x{address}",
+                    pw.workspace
+                ))
+                .await,
+            );
+        }
     }
 
     if restore_geometry
@@ -1966,7 +2099,7 @@ mod tests {
             position: None,
             size: None,
             rule_name: "hyprresume-slow-app".to_string(),
-            anchor: None,
+            placement: PlacementHint::None,
         }];
         let all_rules = vec!["hyprresume-slow-app".to_string()];
 
@@ -2022,7 +2155,10 @@ mod tests {
             position: None,
             size: None,
             rule_name: "hyprresume-slack".to_string(),
-            anchor: Some(("anchor789".to_string(), dwindle::PreselDir::Bottom)),
+            placement: PlacementHint::DwindleAnchor(
+                "anchor789".to_string(),
+                dwindle::PreselDir::Bottom,
+            ),
         }];
         let all_rules = vec!["hyprresume-slack".to_string()];
 
@@ -2059,6 +2195,113 @@ mod tests {
         s2.abort();
     }
 
+    /// A late-appearing "extra master" window under the master layout must
+    /// get promoted via `layoutmsg addmaster` once it lands, not just a bare
+    /// `movetoworkspacesilent` — otherwise it silently ends up stuck in the
+    /// stack instead of promoted to master, since master has no
+    /// per-window anchor/preselect concept for `place_window_in_bsp_slot`
+    /// to fall back on.
+    #[tokio::test]
+    async fn late_watcher_promotes_master_window_after_placement() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock1 = dir.path().join("s1.sock");
+        let sock2 = dir.path().join("s2.sock");
+
+        let (mock1, log) = RecordingSocket1::new(&sock1);
+        let s1 = tokio::spawn(mock1.serve());
+
+        let s2 = spawn_delayed_socket2(
+            &sock2,
+            vec![(
+                Duration::from_millis(100),
+                "openwindow>>master1,4,thunar,Files".to_string(),
+            )],
+        );
+
+        let paths = HyprSocketPaths::new(sock1, sock2);
+        let pending = vec![PendingWindow {
+            app_id: "thunar".to_string(),
+            workspace: "4".to_string(),
+            floating: false,
+            fullscreen: false,
+            position: None,
+            size: None,
+            rule_name: "hyprresume-thunar".to_string(),
+            placement: PlacementHint::MasterPromote,
+        }];
+        let all_rules = vec!["hyprresume-thunar".to_string()];
+
+        watch_late_windows(paths, pending, all_rules, false, Duration::from_secs(5)).await;
+
+        let commands = log.lock().await;
+        assert!(
+            commands
+                .iter()
+                .any(|c| c.contains("movetoworkspacesilent 4,address:0xmaster1")),
+            "expected workspace move, got: {commands:?}"
+        );
+        assert!(
+            commands.iter().any(|c| c.contains("layoutmsg addmaster")),
+            "expected the late-appearing extra-master window to be \
+             promoted, got: {commands:?}"
+        );
+        drop(commands);
+
+        s1.abort();
+        s2.abort();
+    }
+
+    /// A late-appearing stack (or first-master) window must not be
+    /// promoted — only extra-master windows carry `PlacementHint::MasterPromote`.
+    #[tokio::test]
+    async fn late_watcher_does_not_promote_plain_master_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock1 = dir.path().join("s1.sock");
+        let sock2 = dir.path().join("s2.sock");
+
+        let (mock1, log) = RecordingSocket1::new(&sock1);
+        let s1 = tokio::spawn(mock1.serve());
+
+        let s2 = spawn_delayed_socket2(
+            &sock2,
+            vec![(
+                Duration::from_millis(100),
+                "openwindow>>stack1,4,kitty,Kitty".to_string(),
+            )],
+        );
+
+        let paths = HyprSocketPaths::new(sock1, sock2);
+        let pending = vec![PendingWindow {
+            app_id: "kitty".to_string(),
+            workspace: "4".to_string(),
+            floating: false,
+            fullscreen: false,
+            position: None,
+            size: None,
+            rule_name: "hyprresume-kitty".to_string(),
+            placement: PlacementHint::None,
+        }];
+        let all_rules = vec!["hyprresume-kitty".to_string()];
+
+        watch_late_windows(paths, pending, all_rules, false, Duration::from_secs(5)).await;
+
+        let commands = log.lock().await;
+        assert!(
+            commands
+                .iter()
+                .any(|c| c.contains("movetoworkspacesilent 4,address:0xstack1")),
+            "expected workspace move, got: {commands:?}"
+        );
+        assert!(
+            !commands.iter().any(|c| c.contains("addmaster")),
+            "a stack window must never be promoted, got: {commands:?}"
+        );
+        drop(commands);
+
+        s1.abort();
+        s2.abort();
+    }
+
     /// Verifies that when a pending window never appears, the watcher
     /// times out after the grace period and still cleans up all rules.
     #[tokio::test]
@@ -2087,7 +2330,7 @@ mod tests {
             position: None,
             size: None,
             rule_name: "hyprresume-missing-app".to_string(),
-            anchor: None,
+            placement: PlacementHint::None,
         }];
         let all_rules = vec!["hyprresume-missing-app".to_string()];
 
@@ -2148,7 +2391,7 @@ mod tests {
             position: Some((200, 150)),
             size: Some((800, 600)),
             rule_name: "hyprresume-floater".to_string(),
-            anchor: None,
+            placement: PlacementHint::None,
         }];
         let all_rules = vec!["hyprresume-floater".to_string()];
 
@@ -2215,7 +2458,7 @@ mod tests {
                 position: None,
                 size: None,
                 rule_name: "hyprresume-app-a".to_string(),
-                anchor: None,
+                placement: PlacementHint::None,
             },
             PendingWindow {
                 app_id: "app-b".to_string(),
@@ -2225,7 +2468,7 @@ mod tests {
                 position: None,
                 size: None,
                 rule_name: "hyprresume-app-b".to_string(),
-                anchor: None,
+                placement: PlacementHint::None,
             },
         ];
         let all_rules = vec![
@@ -2385,6 +2628,228 @@ mod tests {
         s1.abort();
     }
 
+    /// The master-layout path has no BSP placement primitives, so it can't
+    /// reuse `retile_superseding_window` directly — but it must still catch
+    /// a transient splash window (the exact Discord scenario 314255e fixed
+    /// for dwindle) via `launch_and_track`'s `MasterRole`-gated call to the
+    /// shared `resolve_splash_supersede` helper. An "extra master" window
+    /// (`MasterRole::Promote`) must land and get promoted using the real
+    /// window's address, with the stale splash closed and never promoted.
+    #[tokio::test]
+    async fn launch_and_track_master_promote_supersedes_splash_before_promoting() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock1 = dir.path().join("s1.sock");
+        let sock2 = dir.path().join("s2.sock");
+
+        let (mock1, log, _clients) = RecordingSocket1::with_clients(&sock1, "[]".to_string());
+        let s1 = tokio::spawn(mock1.serve());
+
+        let ctl = HyprCtl::new(HyprSocketPaths::new(sock1, sock2));
+        let engine = RestoreEngine::new(true, true);
+        let (tx, mut events) = mpsc::channel::<HyprEvent>(8);
+        tx.send(HyprEvent::OpenWindow {
+            address: "splash1".to_string(),
+            workspace: "1".to_string(),
+            class: "discord".to_string(),
+        })
+        .await
+        .unwrap();
+        tx.send(HyprEvent::OpenWindow {
+            address: "realwin1".to_string(),
+            workspace: "1".to_string(),
+            class: "discord".to_string(),
+        })
+        .await
+        .unwrap();
+
+        let mut active_rules = Vec::new();
+        let mut pending = Vec::new();
+        let mut live_pool = LiveWindowPool::new(vec![]);
+        let window = make_entry("discord", "discord", None, None);
+
+        let outcome = engine
+            .launch_and_track(
+                &window,
+                &ctl,
+                &mut events,
+                &mut active_rules,
+                &mut pending,
+                &mut live_pool,
+                MasterRole::Promote,
+            )
+            .await
+            .unwrap();
+
+        match outcome {
+            LaunchOutcome::Opened(addr) => assert_eq!(addr, "realwin1"),
+            other => panic!("expected the real window to be tracked, got {other:?}"),
+        }
+        assert!(pending.is_empty(), "must not defer once opened");
+
+        let commands = log.lock().await;
+        assert!(
+            commands
+                .iter()
+                .any(|c| c.contains("closewindow address:0xsplash1")),
+            "expected the stale splash to be closed, got: {commands:?}"
+        );
+        assert!(
+            commands
+                .iter()
+                .any(|c| c.contains("movetoworkspacesilent 1,address:0xrealwin1")),
+            "expected the real window moved to its workspace, got: {commands:?}"
+        );
+        assert!(
+            !commands
+                .iter()
+                .any(|c| c.contains("address:0xsplash1") && c.contains("movetoworkspacesilent")),
+            "the splash window must never be placed, got: {commands:?}"
+        );
+        assert!(
+            commands.iter().any(|c| c.contains("layoutmsg addmaster")),
+            "expected the real window to be promoted, got: {commands:?}"
+        );
+        drop(commands);
+
+        s1.abort();
+    }
+
+    /// A plain master-layout window (first master, or a stack window) still
+    /// gets the splash-supersede check, but must never be promoted — only
+    /// `MasterRole::Promote` (an extra master window) triggers `addmaster`.
+    #[tokio::test]
+    async fn launch_and_track_master_plain_supersedes_splash_without_promoting() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock1 = dir.path().join("s1.sock");
+        let sock2 = dir.path().join("s2.sock");
+
+        let (mock1, log, _clients) = RecordingSocket1::with_clients(&sock1, "[]".to_string());
+        let s1 = tokio::spawn(mock1.serve());
+
+        let ctl = HyprCtl::new(HyprSocketPaths::new(sock1, sock2));
+        let engine = RestoreEngine::new(true, true);
+        let (tx, mut events) = mpsc::channel::<HyprEvent>(8);
+        tx.send(HyprEvent::OpenWindow {
+            address: "splash2".to_string(),
+            workspace: "1".to_string(),
+            class: "discord".to_string(),
+        })
+        .await
+        .unwrap();
+        tx.send(HyprEvent::OpenWindow {
+            address: "realwin2".to_string(),
+            workspace: "1".to_string(),
+            class: "discord".to_string(),
+        })
+        .await
+        .unwrap();
+
+        let mut active_rules = Vec::new();
+        let mut pending = Vec::new();
+        let mut live_pool = LiveWindowPool::new(vec![]);
+        let window = make_entry("discord", "discord", None, None);
+
+        let outcome = engine
+            .launch_and_track(
+                &window,
+                &ctl,
+                &mut events,
+                &mut active_rules,
+                &mut pending,
+                &mut live_pool,
+                MasterRole::Plain,
+            )
+            .await
+            .unwrap();
+
+        match outcome {
+            LaunchOutcome::Opened(addr) => assert_eq!(addr, "realwin2"),
+            other => panic!("expected the real window to be tracked, got {other:?}"),
+        }
+
+        let commands = log.lock().await;
+        assert!(
+            commands
+                .iter()
+                .any(|c| c.contains("closewindow address:0xsplash2")),
+            "expected the stale splash to be closed, got: {commands:?}"
+        );
+        assert!(
+            commands
+                .iter()
+                .any(|c| c.contains("movetoworkspacesilent 1,address:0xrealwin2")),
+            "expected the real window moved to its workspace, got: {commands:?}"
+        );
+        assert!(
+            !commands.iter().any(|c| c.contains("addmaster")),
+            "a plain-role window must never be promoted, got: {commands:?}"
+        );
+        drop(commands);
+
+        s1.abort();
+    }
+
+    /// Deferring a master-layout window to the late-window watcher must not
+    /// immediately dispatch `layoutmsg addmaster` against whatever happens
+    /// to be focused right now — the window doesn't exist yet. The
+    /// promotion must instead be carried on the `PendingWindow` so the
+    /// watcher can apply it once the window actually appears (see
+    /// `late_watcher_promotes_master_window_after_placement`).
+    #[tokio::test]
+    async fn launch_and_track_master_promote_defers_without_immediate_addmaster() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock1 = dir.path().join("s1.sock");
+        let sock2 = dir.path().join("s2.sock");
+
+        let (mock1, log, _clients) = RecordingSocket1::with_clients(&sock1, "[]".to_string());
+        let s1 = tokio::spawn(mock1.serve());
+
+        let ctl = HyprCtl::new(HyprSocketPaths::new(sock1, sock2));
+        let engine =
+            RestoreEngine::new(true, true).with_window_appear_timeout(Duration::from_millis(50));
+        let (_tx, mut events) = mpsc::channel::<HyprEvent>(8);
+
+        let mut active_rules = Vec::new();
+        let mut pending = Vec::new();
+        let mut live_pool = LiveWindowPool::new(vec![]);
+        let window = make_entry("slow-master-app", "slow-master-app", None, None);
+
+        let outcome = engine
+            .launch_and_track(
+                &window,
+                &ctl,
+                &mut events,
+                &mut active_rules,
+                &mut pending,
+                &mut live_pool,
+                MasterRole::Promote,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(outcome, LaunchOutcome::Deferred),
+            "expected a deferred outcome, got {outcome:?}"
+        );
+        assert_eq!(pending.len(), 1, "expected one pending window");
+        assert!(
+            matches!(pending[0].placement, PlacementHint::MasterPromote),
+            "expected the pending window to carry the promotion hint for \
+             the late-window watcher to apply, got {:?}",
+            pending[0].placement
+        );
+
+        let commands = log.lock().await;
+        assert!(
+            !commands.iter().any(|c| c.contains("addmaster")),
+            "must not dispatch addmaster immediately against whatever is \
+             currently focused before the window even exists, got: {commands:?}"
+        );
+        drop(commands);
+
+        s1.abort();
+    }
+
     // --- LiveWindowPool ---
 
     #[test]
@@ -2498,6 +2963,7 @@ mod tests {
                 &mut active_rules,
                 &mut pending,
                 &mut live_pool,
+                MasterRole::None,
             )
             .await
             .unwrap();
@@ -2553,6 +3019,7 @@ mod tests {
                 &mut active_rules,
                 &mut pending,
                 &mut live_pool,
+                MasterRole::None,
             )
             .await
             .unwrap();
@@ -3725,6 +4192,7 @@ mod tests {
                 &mut active_rules,
                 &mut pending,
                 &mut live_pool,
+                MasterRole::None,
             )
             .await
             .unwrap();
