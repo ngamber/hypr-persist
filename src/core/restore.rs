@@ -863,13 +863,14 @@ impl RestoreEngine {
             }
         }
 
-        if ctl
-            .dispatch(&format!("focuswindow address:0x{real_addr}"))
-            .await
-            .is_ok()
-        {
-            tracing::debug!("retile: focus real again ok");
-        }
+        // Deliberately do NOT re-focus real_addr here before settling it.
+        // setfloating targets real_addr directly by address, so refocusing
+        // isn't needed to target it — and live-testing showed that doing so
+        // breaks the preselect binding set up above (Hyprland appears to tie
+        // the pending preselect to whatever is focused when the floating->
+        // tiled transition happens, so shifting focus away from the anchor
+        // right before settling re-inserts the window in the wrong place,
+        // e.g. next to whatever was previously active instead of the anchor).
         if ctl
             .dispatch(&format!("setfloating address:0x{real_addr}"))
             .await
