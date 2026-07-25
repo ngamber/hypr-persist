@@ -1060,7 +1060,8 @@ impl RestoreEngine {
         let mut last_attempted: HashMap<usize, (i32, i32)> = HashMap::new();
 
         for pass in 0..max_passes {
-            let mut resized = false;
+            let mut dispatched = false;
+            let mut any_out_of_tolerance = false;
 
             for (idx, addr) in &candidates {
                 let window = &session.windows[*idx];
@@ -1075,38 +1076,50 @@ impl RestoreEngine {
                 let dh = saved_h - client.size.1;
 
                 if dw.abs() > TOLERANCE || dh.abs() > TOLERANCE {
+                    any_out_of_tolerance = true;
+
                     if last_attempted.get(idx) == Some(&(dw, dh)) {
                         tracing::debug!(
                             "  pass {}: {} still off by ({dw}, {dh}), matching the \
-                             previous attempt — not re-dispatching",
+                             previous attempt — not re-dispatching, checking other candidates",
                             pass + 1,
                             window.app_id,
                         );
-                    } else {
-                        tracing::debug!(
-                            "  pass {}: resize {} by ({dw}, {dh})",
-                            pass + 1,
-                            window.app_id,
-                        );
-                        last_attempted.insert(*idx, (dw, dh));
-                        match ctl
-                            .dispatch(&format!("resizewindowpixel {dw} {dh},address:0x{addr}"))
-                            .await
-                        {
-                            Ok(resp) if resp.trim() != "ok" => {
-                                tracing::warn!("  resize failed: {resp}");
-                            }
-                            Err(e) => tracing::warn!("  resize ipc error: {e}"),
-                            _ => {}
-                        }
+                        continue;
                     }
-                    resized = true;
+
+                    tracing::debug!(
+                        "  pass {}: resize {} by ({dw}, {dh})",
+                        pass + 1,
+                        window.app_id,
+                    );
+                    last_attempted.insert(*idx, (dw, dh));
+                    match ctl
+                        .dispatch(&format!("resizewindowpixel {dw} {dh},address:0x{addr}"))
+                        .await
+                    {
+                        Ok(resp) if resp.trim() != "ok" => {
+                            tracing::warn!("  resize failed: {resp}");
+                        }
+                        Err(e) => tracing::warn!("  resize ipc error: {e}"),
+                        _ => {}
+                    }
+                    dispatched = true;
                     break;
                 }
             }
 
-            if !resized {
+            if !any_out_of_tolerance {
                 tracing::debug!("  tiled sizes converged after {} pass(es)", pass + 1);
+                return;
+            }
+
+            if !dispatched {
+                tracing::debug!(
+                    "  tiled sizes settled after {} pass(es); remaining candidates unchanged \
+                     since their last attempt",
+                    pass + 1
+                );
                 return;
             }
 
@@ -2775,15 +2788,16 @@ mod tests {
 
     /// Two tiled windows sharing a BSP split edge (e.g. left/right column
     /// mates in a 2x2 dwindle grid) must never both be independently resized
-    /// in the same pass. The mock's `j/clients` response is static, so
-    /// neither window's mismatch ever actually resolves — meaning a fixed
-    /// implementation must keep retrying only the first (lowest-index)
-    /// still-mismatched candidate every pass, and must never reach the
-    /// second while the first remains unresolved. The pre-fix algorithm
-    /// dispatched a resize for every out-of-tolerance window unconditionally
-    /// within the same pass, which is exactly the shared-edge fight observed
-    /// on a real reboot (both sides independently fighting over the same
-    /// boundary, rejected as "Invalid size").
+    /// in the same pass — that's the shared-edge fight observed on a real
+    /// reboot (both sides fighting over the same boundary, each rejected as
+    /// "Invalid size"). The mock's `j/clients` response is static, so left's
+    /// mismatch never actually resolves: it gets one dispatch, is found
+    /// stuck (unchanging) on the next pass, and only then does the pass
+    /// move on to right. Right must never be dispatched in the *same* pass
+    /// as left (that would be the fight this test guards against), but once
+    /// left is confirmed permanently stuck it must not block right forever
+    /// either — see `converge_tiled_sizes_lets_other_candidates_through_a_
+    /// permanently_stuck_one` for that starvation case.
     #[tokio::test]
     async fn converge_tiled_sizes_never_resizes_two_shared_edge_windows_in_one_pass() {
         let dir = tempfile::tempdir().unwrap();
@@ -2827,19 +2841,155 @@ mod tests {
             .await;
 
         let commands = log.lock().await;
-        let resize_cmds: Vec<&String> = commands
+        let resize_indices: Vec<usize> = commands
             .iter()
-            .filter(|c| c.contains("resizewindowpixel"))
+            .enumerate()
+            .filter(|(_, c)| c.contains("resizewindowpixel"))
+            .map(|(i, _)| i)
             .collect();
+        assert_eq!(
+            resize_indices.len(),
+            2,
+            "expected exactly one resize attempt each for left and right \
+             (left first, then right once left is confirmed stuck), got: {commands:?}"
+        );
+        let (left_idx, right_idx) = (resize_indices[0], resize_indices[1]);
         assert!(
-            !resize_cmds.is_empty(),
-            "expected at least one resize attempt, got: {commands:?}"
+            commands[left_idx].contains("address:0xleft001"),
+            "left must be resized first, got: {commands:?}"
         );
         assert!(
-            resize_cmds.iter().all(|c| c.contains("address:0xleft001")),
-            "the second window sharing the split edge must never be \
-             independently resized while the first remains unresolved in \
-             the same run, got: {commands:?}"
+            commands[right_idx].contains("address:0xright01"),
+            "right must be resized second, got: {commands:?}"
+        );
+        assert!(
+            commands[left_idx + 1..right_idx]
+                .iter()
+                .any(|c| c.contains("j/clients")),
+            "right must never be resized in the same pass as left's own \
+             dispatch — there must be at least one recheck of left (a new \
+             pass) confirming it's stuck before right ever gets a turn, \
+             got: {commands:?}"
+        );
+        drop(commands);
+
+        s1.abort();
+    }
+
+    /// A permanently-stuck lowest-index candidate must not consume every
+    /// pass for the entire `max_passes` budget and starve every other
+    /// out-of-tolerance candidate later in index order. Observed live: a
+    /// reboot where one window's resize delta never changed across all
+    /// passes — harmless that time because it was the only mismatched
+    /// window, but nothing in the pre-fix loop stopped it from silently
+    /// preventing any *other* window elsewhere in the session from ever
+    /// being resized, since `resized = true; break;` fired unconditionally
+    /// for the first out-of-tolerance candidate whether or not a dispatch
+    /// was actually sent. Three candidates here: the lowest-index one is
+    /// permanently stuck (its delta never changes, unrelated to any shared
+    /// edge), a middle one is already in tolerance, and the highest-index
+    /// one would actually resolve once given its own dispatch.
+    #[tokio::test]
+    async fn converge_tiled_sizes_lets_other_candidates_through_a_permanently_stuck_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock1 = dir.path().join("s1.sock");
+        let sock2 = dir.path().join("s2.sock");
+
+        let unresolved_json = r#"[{"address":"0xstuck01","class":"discord","pid":1,
+            "workspace":{"id":4,"name":"4"},"monitor":0,
+            "at":[0,0],"size":[700,500],"floating":false,"fullscreen":0},
+            {"address":"0xsteady1","class":"kitty","pid":2,
+            "workspace":{"id":4,"name":"4"},"monitor":0,
+            "at":[700,0],"size":[400,300],"floating":false,"fullscreen":0},
+            {"address":"0xresolv3","class":"thunar","pid":3,
+            "workspace":{"id":4,"name":"4"},"monitor":0,
+            "at":[1100,0],"size":[850,650],"floating":false,"fullscreen":0}]"#
+            .to_string();
+        let resolved_json = r#"[{"address":"0xstuck01","class":"discord","pid":1,
+            "workspace":{"id":4,"name":"4"},"monitor":0,
+            "at":[0,0],"size":[700,500],"floating":false,"fullscreen":0},
+            {"address":"0xsteady1","class":"kitty","pid":2,
+            "workspace":{"id":4,"name":"4"},"monitor":0,
+            "at":[700,0],"size":[400,300],"floating":false,"fullscreen":0},
+            {"address":"0xresolv3","class":"thunar","pid":3,
+            "workspace":{"id":4,"name":"4"},"monitor":0,
+            "at":[1100,0],"size":[900,700],"floating":false,"fullscreen":0}]"#
+            .to_string();
+
+        let (mock1, log, clients) = RecordingSocket1::with_clients(&sock1, unresolved_json);
+        let s1 = tokio::spawn(mock1.serve());
+
+        // Once the third candidate's resize is dispatched, simulate Hyprland
+        // having applied it by swapping in geometry where that window (and
+        // only that window) now matches its saved size.
+        let watcher_log = log.clone();
+        let watcher = tokio::spawn(async move {
+            loop {
+                let seen = watcher_log
+                    .lock()
+                    .await
+                    .iter()
+                    .any(|c| c.contains("resizewindowpixel") && c.contains("0xresolv3"));
+                if seen {
+                    *clients.lock().await = resolved_json;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+
+        let ctl = HyprCtl::new(HyprSocketPaths::new(sock1, sock2));
+        let engine = RestoreEngine::new(true, true);
+
+        let mut stuck = entry_with_position("discord", "4", (0, 0));
+        stuck.size = Some((800, 600));
+        let mut steady = entry_with_position("kitty", "4", (700, 0));
+        steady.size = Some((400, 300));
+        let mut resolvable = entry_with_position("thunar", "4", (1100, 0));
+        resolvable.size = Some((900, 700));
+
+        let session = SessionFile {
+            session: crate::models::SessionMeta {
+                name: "t".to_string(),
+                timestamp: 0,
+            },
+            windows: vec![stuck, steady, resolvable],
+        };
+
+        let mut addresses = HashMap::new();
+        addresses.insert(0usize, "stuck01".to_string());
+        addresses.insert(1usize, "steady1".to_string());
+        addresses.insert(2usize, "resolv3".to_string());
+        let adopted = HashSet::new();
+
+        engine
+            .converge_tiled_sizes(&session, &ctl, &addresses, &adopted)
+            .await;
+
+        watcher.abort();
+
+        let commands = log.lock().await;
+        assert!(
+            commands
+                .iter()
+                .any(|c| c.contains("resizewindowpixel") && c.contains("0xresolv3")),
+            "the resolvable higher-index candidate must get its resize \
+             dispatched despite the lowest-index candidate never \
+             converging, got: {commands:?}"
+        );
+        assert!(
+            !commands.iter().any(|c| c.contains("0xsteady1")),
+            "the already-in-tolerance middle candidate must never be \
+             touched, got: {commands:?}"
+        );
+        let stuck_resize_count = commands
+            .iter()
+            .filter(|c| c.contains("resizewindowpixel") && c.contains("0xstuck01"))
+            .count();
+        assert_eq!(
+            stuck_resize_count, 1,
+            "the permanently-stuck candidate must still only be dispatched \
+             once, not re-issued every pass, got: {commands:?}"
         );
         drop(commands);
 
