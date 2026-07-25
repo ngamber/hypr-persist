@@ -781,10 +781,14 @@ impl RestoreEngine {
     /// normally do this was already disabled once the splash appeared, so
     /// the real window otherwise opens wherever Hyprland defaults to — the
     /// currently active workspace, which is not necessarily the target one),
-    /// focus the original anchor, re-issue preselect, focus the real
-    /// window, float it out, then settle it back in (Hyprland places a
-    /// window that transitions floating->tiled at the current preselect
-    /// slot, same as a brand-new window).
+    /// float it out of the tree, THEN focus the anchor and issue preselect
+    /// as the very last step before settling it back in. Preselect must be
+    /// issued immediately before the floating->tiled transition that
+    /// consumes it — issuing it earlier (with a focus/float sequence still
+    /// to come) risks it being cleared by that intervening tiling-state
+    /// change, which is exactly what caused a live-tested regression:
+    /// Discord landed in the wrong BSP column despite every dispatch
+    /// reporting success.
     ///
     /// Returns the address that should be tracked as this window's final
     /// address — either `first_addr` unchanged if no second window showed
@@ -827,6 +831,21 @@ impl RestoreEngine {
             tracing::debug!("retile: move to workspace ok");
         }
 
+        if ctl
+            .dispatch(&format!("focuswindow address:0x{real_addr}"))
+            .await
+            .is_ok()
+        {
+            tracing::debug!("retile: focus real ok");
+        }
+        if ctl
+            .dispatch(&format!("setfloating address:0x{real_addr}"))
+            .await
+            .is_ok()
+        {
+            tracing::debug!("retile: float ok");
+        }
+
         if let Some((anchor_addr, presel)) = anchor {
             if ctl
                 .dispatch(&format!("focuswindow address:0x{anchor_addr}"))
@@ -849,14 +868,7 @@ impl RestoreEngine {
             .await
             .is_ok()
         {
-            tracing::debug!("retile: focus real ok");
-        }
-        if ctl
-            .dispatch(&format!("setfloating address:0x{real_addr}"))
-            .await
-            .is_ok()
-        {
-            tracing::debug!("retile: float ok");
+            tracing::debug!("retile: focus real again ok");
         }
         if ctl
             .dispatch(&format!("setfloating address:0x{real_addr}"))
