@@ -337,7 +337,7 @@ impl RestoreEngine {
     ) -> Result<()> {
         let (floating, ws_plans, fallback_windows) = Self::build_dwindle_plans(session);
 
-        let addresses = self
+        let (addresses, adopted) = self
             .execute_bsp_plans(
                 session,
                 ctl,
@@ -350,9 +350,12 @@ impl RestoreEngine {
             )
             .await?;
 
-        self.apply_split_ratios(ctl, &ws_plans, &addresses).await;
-        self.converge_tiled_sizes(session, ctl, &addresses).await;
-        self.apply_fullscreen(session, ctl, &addresses).await?;
+        self.apply_split_ratios(ctl, &ws_plans, &addresses, &adopted)
+            .await;
+        self.converge_tiled_sizes(session, ctl, &addresses, &adopted)
+            .await;
+        self.apply_fullscreen(session, ctl, &addresses, &adopted)
+            .await?;
 
         self.restore_indexed(
             session,
@@ -607,8 +610,9 @@ impl RestoreEngine {
         active_rules: &mut Vec<String>,
         pending: &mut Vec<PendingWindow>,
         live_pool: &mut LiveWindowPool,
-    ) -> Result<HashMap<usize, String>> {
+    ) -> Result<(HashMap<usize, String>, HashSet<usize>)> {
         let mut addresses: HashMap<usize, String> = HashMap::new();
+        let mut adopted: HashSet<usize> = HashSet::new();
         let mut sorted_ws: Vec<&String> = ws_plans.keys().collect();
         sorted_ws.sort();
         let mut rule_counter = 0usize;
@@ -629,6 +633,7 @@ impl RestoreEngine {
                     let addr = normalize_address(&live.address);
                     tracing::info!("  adopted already-open {} (0x{addr})", window.app_id);
                     addresses.insert(step.window_idx, addr);
+                    adopted.insert(step.window_idx);
                     report.restored += 1;
                     continue;
                 }
@@ -679,7 +684,7 @@ impl RestoreEngine {
             }
         }
 
-        Ok(addresses)
+        Ok((addresses, adopted))
     }
 
     /// BSP-specific launch: switches to the workspace first (so preselect
@@ -866,12 +871,15 @@ impl RestoreEngine {
 
     /// Apply `layoutmsg splitratio <delta>` for each split node in the BSP tree
     /// that has a direct leaf child. The delta is computed from the default 0.5
-    /// ratio since freshly-created windows always start at the default.
+    /// ratio since freshly-created windows always start at the default — this
+    /// does not hold for adopted windows (already live before this restore, at
+    /// whatever ratio they already have), so those are skipped entirely.
     async fn apply_split_ratios(
         &self,
         ctl: &HyprCtl,
         ws_plans: &HashMap<String, DwindlePlan>,
         addresses: &HashMap<usize, String>,
+        adopted: &HashSet<usize>,
     ) {
         let mut applied = 0usize;
         let mut sorted_ws: Vec<&String> = ws_plans.keys().collect();
@@ -880,6 +888,9 @@ impl RestoreEngine {
         for ws in sorted_ws {
             let plan = &ws_plans[ws];
             for step in &plan.ratio_steps {
+                if adopted.contains(&step.focus_window_idx) {
+                    continue;
+                }
                 let Some(addr) = addresses.get(&step.focus_window_idx) else {
                     continue;
                 };
@@ -907,11 +918,16 @@ impl RestoreEngine {
         }
     }
 
+    /// Adopted windows are skipped: they were already live before this
+    /// restore, in whatever shape the current tree gives them, so nudging
+    /// them toward the saved size fights the tree's actual layout instead of
+    /// correcting anything (observed: a window driven to near-zero size).
     async fn converge_tiled_sizes(
         &self,
         session: &SessionFile,
         ctl: &HyprCtl,
         addresses: &HashMap<usize, String>,
+        adopted: &HashSet<usize>,
     ) {
         const MAX_PASSES: usize = 4;
         const TOLERANCE: i32 = 6;
@@ -920,6 +936,9 @@ impl RestoreEngine {
             let mut all_ok = true;
 
             for (idx, addr) in addresses {
+                if adopted.contains(idx) {
+                    continue;
+                }
                 let window = &session.windows[*idx];
                 let Some((saved_w, saved_h)) = window.size else {
                     continue;
@@ -961,14 +980,20 @@ impl RestoreEngine {
         tracing::debug!("  tiled sizes settled after {MAX_PASSES} passes");
     }
 
-    /// Iterative convergence: re-query window sizes and apply pixel corrections
+    /// `fullscreen` is a toggle, not a set — an adopted window that was
+    /// already fullscreen before this restore would be un-fullscreened by
+    /// re-issuing it, so adopted windows are skipped here too.
     async fn apply_fullscreen(
         &self,
         session: &SessionFile,
         ctl: &HyprCtl,
         addresses: &HashMap<usize, String>,
+        adopted: &HashSet<usize>,
     ) -> Result<()> {
         for (idx, addr) in addresses {
+            if adopted.contains(idx) {
+                continue;
+            }
             let window = &session.windows[*idx];
             if window.fullscreen {
                 ctl.dispatch(&format!("fullscreen 0,address:0x{addr}"))
@@ -2213,7 +2238,7 @@ mod tests {
         let mut live_pool =
             LiveWindowPool::new(vec![make_tracked("0xLIVE01", "foot", "1", (0, 0))]);
 
-        let addresses = engine
+        let (addresses, adopted) = engine
             .execute_bsp_plans(
                 &session,
                 &ctl,
@@ -2230,6 +2255,8 @@ mod tests {
         assert_eq!(report.restored, 2);
         assert_eq!(addresses.get(&0), Some(&"live01".to_string()));
         assert_eq!(addresses.get(&1), Some(&"newwin1".to_string()));
+        assert!(adopted.contains(&0), "window 0 was adopted, not launched");
+        assert!(!adopted.contains(&1), "window 1 was freshly launched");
 
         let commands = log.lock().await;
         assert!(
@@ -2245,6 +2272,170 @@ mod tests {
         assert!(
             commands.iter().any(|c| c.contains("layoutmsg preselect r")),
             "expected preselect for the second step, got: {commands:?}"
+        );
+        drop(commands);
+
+        s1.abort();
+    }
+
+    // --- adopted-window convergence skip ---
+
+    /// An adopted window's own splitratio step must not be applied: it never
+    /// went through the fresh-insertion default-0.5 dance this delta assumes.
+    /// A sibling step for a freshly-launched window in the same call must
+    /// still be applied normally.
+    #[tokio::test]
+    async fn apply_split_ratios_skips_adopted_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock1 = dir.path().join("s1.sock");
+        let sock2 = dir.path().join("s2.sock");
+
+        let (mock1, log) = RecordingSocket1::new(&sock1);
+        let s1 = tokio::spawn(mock1.serve());
+
+        let ctl = HyprCtl::new(HyprSocketPaths::new(sock1, sock2));
+        let engine = RestoreEngine::new(true, true);
+
+        let mut ws_plans = HashMap::new();
+        ws_plans.insert(
+            "1".to_string(),
+            DwindlePlan {
+                steps: vec![],
+                ratio_steps: vec![
+                    dwindle::SplitRatioStep {
+                        focus_window_idx: 0,
+                        ratio: 0.7,
+                    },
+                    dwindle::SplitRatioStep {
+                        focus_window_idx: 1,
+                        ratio: 0.3,
+                    },
+                ],
+            },
+        );
+
+        let mut addresses = HashMap::new();
+        addresses.insert(0, "adopted01".to_string());
+        addresses.insert(1, "fresh01".to_string());
+        let mut adopted = HashSet::new();
+        adopted.insert(0);
+
+        engine
+            .apply_split_ratios(&ctl, &ws_plans, &addresses, &adopted)
+            .await;
+
+        let commands = log.lock().await;
+        assert!(
+            !commands.iter().any(|c| c.contains("address:0xadopted01")),
+            "adopted window must not be focused/resplit, got: {commands:?}"
+        );
+        assert!(
+            commands
+                .iter()
+                .any(|c| c.contains("focuswindow address:0xfresh01")),
+            "freshly-launched window must still get its splitratio applied, got: {commands:?}"
+        );
+        assert!(
+            commands.iter().any(|c| c.contains("layoutmsg splitratio")),
+            "expected a splitratio dispatch for the non-adopted window, got: {commands:?}"
+        );
+        drop(commands);
+
+        s1.abort();
+    }
+
+    /// An adopted window must not be queried or resized toward the saved
+    /// session size — it was already live before this restore in whatever
+    /// shape the current tree gives it.
+    #[tokio::test]
+    async fn converge_tiled_sizes_skips_adopted_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock1 = dir.path().join("s1.sock");
+        let sock2 = dir.path().join("s2.sock");
+
+        let (mock1, log) = RecordingSocket1::new(&sock1);
+        let s1 = tokio::spawn(mock1.serve());
+
+        let ctl = HyprCtl::new(HyprSocketPaths::new(sock1, sock2));
+        let engine = RestoreEngine::new(true, true);
+
+        let mut window = entry_with_position("discord", "4", (0, 0));
+        window.size = Some((1200, 800));
+        let session = SessionFile {
+            session: crate::models::SessionMeta {
+                name: "t".to_string(),
+                timestamp: 0,
+            },
+            windows: vec![window],
+        };
+
+        let mut addresses = HashMap::new();
+        addresses.insert(0usize, "adopted02".to_string());
+        let mut adopted = HashSet::new();
+        adopted.insert(0);
+
+        engine
+            .converge_tiled_sizes(&session, &ctl, &addresses, &adopted)
+            .await;
+
+        let commands = log.lock().await;
+        assert!(
+            commands.is_empty(),
+            "adopted window must not be queried or resized at all, got: {commands:?}"
+        );
+        drop(commands);
+
+        s1.abort();
+    }
+
+    /// An adopted window that was already fullscreen must not have
+    /// `fullscreen` re-toggled — that would exit fullscreen instead of
+    /// restoring it, since the dispatch toggles rather than sets state.
+    #[tokio::test]
+    async fn apply_fullscreen_skips_adopted_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock1 = dir.path().join("s1.sock");
+        let sock2 = dir.path().join("s2.sock");
+
+        let (mock1, log) = RecordingSocket1::new(&sock1);
+        let s1 = tokio::spawn(mock1.serve());
+
+        let ctl = HyprCtl::new(HyprSocketPaths::new(sock1, sock2));
+        let engine = RestoreEngine::new(true, true);
+
+        let mut adopted_window = entry_with_position("mpv", "2", (0, 0));
+        adopted_window.fullscreen = true;
+        let mut fresh_window = entry_with_position("mpv", "2", (0, 0));
+        fresh_window.fullscreen = true;
+        let session = SessionFile {
+            session: crate::models::SessionMeta {
+                name: "t".to_string(),
+                timestamp: 0,
+            },
+            windows: vec![adopted_window, fresh_window],
+        };
+
+        let mut addresses = HashMap::new();
+        addresses.insert(0usize, "adopted03".to_string());
+        addresses.insert(1usize, "fresh03".to_string());
+        let mut adopted = HashSet::new();
+        adopted.insert(0);
+
+        engine
+            .apply_fullscreen(&session, &ctl, &addresses, &adopted)
+            .await
+            .unwrap();
+
+        let commands = log.lock().await;
+        assert!(
+            !commands.iter().any(|c| c.contains("address:0xadopted03")),
+            "adopted window's fullscreen state must not be toggled, got: {commands:?}"
+        );
+        assert!(
+            commands
+                .iter()
+                .any(|c| c.contains("fullscreen 0,address:0xfresh03")),
+            "freshly-launched fullscreen window must still be toggled, got: {commands:?}"
         );
         drop(commands);
 
