@@ -1978,7 +1978,7 @@ mod tests {
             "expected focus anchor, got: {commands:?}"
         );
         assert!(
-            commands.iter().any(|c| c.contains("layoutmsg preselect b")),
+            commands.iter().any(|c| c.contains("layoutmsg preselect d")),
             "expected preselect, got: {commands:?}"
         );
         assert!(
