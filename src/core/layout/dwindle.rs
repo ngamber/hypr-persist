@@ -34,9 +34,14 @@ pub enum BspNode {
 pub struct RestoreStep {
     /// Index into the original window list for the window to open.
     pub window_idx: usize,
-    /// If Some, focus this previously-opened window index before opening.
+    /// If Some, this window should be placed adjacent to this previously-
+    /// opened window index once it exists.
     pub focus_idx: Option<usize>,
-    /// If Some, send `layoutmsg preselect <dir>` before opening.
+    /// If Some, the direction to preselect this window relative to
+    /// `focus_idx`. Consumed via `layoutmsg preselect <dir>` immediately
+    /// before the window's placement settles — not before it opens, since a
+    /// preselect binding armed earlier doesn't reliably survive an
+    /// indeterminate wait for the window to actually appear.
     pub preselect: Option<PreselDir>,
 }
 
