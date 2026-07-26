@@ -107,6 +107,14 @@ impl StateManager {
     /// windows from a fresh `j/clients` snapshot. Call before saving to ensure
     /// geometry reflects the user's current layout (Hyprland emits no events
     /// for tiled resize or position changes).
+    ///
+    /// `monitor_map` and `clients` come from two separate sequential IPC
+    /// calls, not one atomic snapshot, so a workspace-to-monitor move landing
+    /// between them can leave a client's monitor ID unresolvable even though
+    /// its workspace/position already reflect the new assignment. When that
+    /// happens we skip the whole update for that window this cycle rather
+    /// than save a record with a fresh workspace/position paired with a
+    /// stale or missing monitor.
     pub fn refresh_geometry(&mut self, clients: &[HyprClient], monitor_map: &HashMap<i64, String>) {
         let client_map: HashMap<String, &HyprClient> = clients
             .iter()
@@ -114,21 +122,30 @@ impl StateManager {
             .collect();
 
         let mut updated = 0usize;
+        let mut skipped = 0usize;
         for (key, window) in &mut self.windows {
-            if let Some(client) = client_map.get(key) {
-                window.position = client.at;
-                window.size = client.size;
-                window.floating = client.floating;
-                window.fullscreen = client.fullscreen_mode > 0;
-                window.workspace.clone_from(&client.workspace.name);
-                if let Some(name) = monitor_map.get(&client.monitor) {
-                    window.monitor.clone_from(name);
-                }
-                updated += 1;
-            }
+            let Some(client) = client_map.get(key) else {
+                continue;
+            };
+            let Some(monitor_name) = monitor_map.get(&client.monitor) else {
+                tracing::warn!(
+                    "skipping geometry refresh for {} ({key}): unresolved monitor id {}",
+                    window.app_id,
+                    client.monitor
+                );
+                skipped += 1;
+                continue;
+            };
+            window.position = client.at;
+            window.size = client.size;
+            window.floating = client.floating;
+            window.fullscreen = client.fullscreen_mode > 0;
+            window.workspace.clone_from(&client.workspace.name);
+            window.monitor.clone_from(monitor_name);
+            updated += 1;
         }
         tracing::debug!(
-            "refreshed geometry for {updated}/{} windows",
+            "refreshed geometry for {updated}/{} windows ({skipped} skipped: unresolved monitor)",
             self.windows.len()
         );
     }
@@ -146,6 +163,7 @@ impl StateManager {
 mod tests {
     use super::*;
     use crate::config::{Config, GeneralConfig, RulesConfig};
+    use crate::models::HyprWorkspace;
     use std::collections::HashMap;
 
     fn test_config(exclude: Vec<&str>, include: Vec<&str>) -> Config {
@@ -359,5 +377,69 @@ mod tests {
         let app_ids: Vec<&str> = windows.iter().map(|w| w.app_id.as_str()).collect();
         assert!(app_ids.contains(&"firefox"));
         assert!(app_ids.contains(&"code"));
+    }
+
+    // --- refresh_geometry ---
+
+    fn make_client(address: &str, workspace: &str, monitor: i64, at: (i32, i32)) -> HyprClient {
+        HyprClient {
+            address: address.to_string(),
+            class: "firefox".to_string(),
+            pid: 123,
+            workspace: HyprWorkspace {
+                name: workspace.to_string(),
+            },
+            monitor,
+            at,
+            size: (1024, 768),
+            floating: false,
+            fullscreen_mode: 0,
+        }
+    }
+
+    #[test]
+    fn refresh_geometry_updates_resolved_monitor() {
+        let mut state = StateManager::new(&test_config(vec![], vec![]));
+        state.add(make_window("0xabc", "firefox", "1"));
+
+        let clients = vec![make_client("0xabc", "4", 1, (2570, 100))];
+        let monitor_map: HashMap<i64, String> = [(1, "DP-3".to_string())].into_iter().collect();
+
+        state.refresh_geometry(&clients, &monitor_map);
+
+        let windows = state.windows();
+        assert_eq!(windows[0].workspace, "4");
+        assert_eq!(windows[0].position, (2570, 100));
+        assert_eq!(windows[0].monitor, "DP-3");
+    }
+
+    #[test]
+    fn refresh_geometry_skips_window_on_unresolved_monitor() {
+        let mut state = StateManager::new(&test_config(vec![], vec![]));
+        let mut window = make_window("0xabc", "firefox", "1");
+        window.monitor = "DP-1".to_string();
+        window.position = (10, 743);
+        state.add(window);
+
+        // Client snapshot claims workspace "4" (bound to monitor id 2) and a
+        // fresh position, but monitor id 2 is missing from monitor_map — the
+        // shape of a workspace-to-monitor move landing between the two
+        // separate hyprctl calls.
+        let clients = vec![make_client("0xabc", "4", 2, (2570, 100))];
+        let monitor_map: HashMap<i64, String> = [(1, "DP-1".to_string())].into_iter().collect();
+
+        state.refresh_geometry(&clients, &monitor_map);
+
+        let windows = state.windows();
+        assert_eq!(
+            windows[0].workspace, "1",
+            "workspace must not update without a resolved monitor"
+        );
+        assert_eq!(
+            windows[0].position,
+            (10, 743),
+            "position must not update without a resolved monitor"
+        );
+        assert_eq!(windows[0].monitor, "DP-1");
     }
 }
