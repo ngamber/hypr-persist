@@ -53,6 +53,22 @@ pub struct SplitRatioStep {
     pub ratio: f64,
 }
 
+/// Post-placement correction for a split node whose two children are both
+/// internal sub-trees rather than a direct leaf window. No window is ever
+/// directly parented by such a split, so `layoutmsg splitratio` (which only
+/// ever adjusts the currently focused window's own immediate parent split)
+/// can never reach it. It's reachable only through a raw pixel resize:
+/// Hyprland's resize dispatcher walks from the resized window up to the
+/// nearest ancestor split matching the resize axis, so resizing the
+/// leftmost leaf of one side lands on exactly this split.
+#[derive(Debug, Clone)]
+pub struct PixelRatioStep {
+    pub dir: SplitDir,
+    pub ratio: f64,
+    pub first_leaf_idx: usize,
+    pub second_leaf_idx: usize,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum PreselDir {
     Right,
@@ -77,6 +93,7 @@ impl std::fmt::Display for PreselDir {
 pub struct DwindlePlan {
     pub steps: Vec<RestoreStep>,
     pub ratio_steps: Vec<SplitRatioStep>,
+    pub pixel_ratio_steps: Vec<PixelRatioStep>,
 }
 
 /// Infer a BSP tree from a set of tiled windows based on their geometry.
@@ -317,6 +334,39 @@ fn collect_ratios_inner(node: &BspNode, steps: &mut Vec<SplitRatioStep>) {
     }
 }
 
+/// Collect `PixelRatioStep`s for every split node whose two children are
+/// both internal sub-trees — the splits `collect_splitratio_steps` cannot
+/// reach because neither child is a direct leaf window.
+fn collect_pixel_ratio_steps(tree: &BspNode) -> Vec<PixelRatioStep> {
+    let mut steps = Vec::new();
+    collect_pixel_ratios_inner(tree, &mut steps);
+    steps
+}
+
+fn collect_pixel_ratios_inner(node: &BspNode, steps: &mut Vec<PixelRatioStep>) {
+    if let BspNode::Split {
+        dir,
+        ratio,
+        first,
+        second,
+    } = node
+    {
+        if !matches!(first.as_ref(), BspNode::Leaf { .. })
+            && !matches!(second.as_ref(), BspNode::Leaf { .. })
+        {
+            steps.push(PixelRatioStep {
+                dir: *dir,
+                ratio: *ratio,
+                first_leaf_idx: leftmost_leaf_idx(first),
+                second_leaf_idx: leftmost_leaf_idx(second),
+            });
+        }
+
+        collect_pixel_ratios_inner(first, steps);
+        collect_pixel_ratios_inner(second, steps);
+    }
+}
+
 /// Build a dwindle restore plan for tiled windows on a single workspace.
 ///
 /// `global_indices` maps each window in `windows` to its index in the full
@@ -332,7 +382,12 @@ pub fn build_workspace_plan(
     let tree = infer_bsp(&indexed, bounds)?;
     let steps = plan_from_bsp(&tree);
     let ratio_steps = collect_splitratio_steps(&tree);
-    Some(DwindlePlan { steps, ratio_steps })
+    let pixel_ratio_steps = collect_pixel_ratio_steps(&tree);
+    Some(DwindlePlan {
+        steps,
+        ratio_steps,
+        pixel_ratio_steps,
+    })
 }
 
 #[cfg(test)]
@@ -653,5 +708,78 @@ mod tests {
         assert_eq!(plan.steps[3].window_idx, 0, "slack splits below discord");
         assert_eq!(plan.steps[3].focus_idx, Some(1));
         assert!(matches!(plan.steps[3].preselect, Some(PreselDir::Bottom)));
+    }
+
+    #[test]
+    fn pixel_ratio_steps_two_windows_has_none() {
+        // The lone split has two direct leaf children, so it's fully
+        // reachable via splitratio: no pixel_ratio_steps expected.
+        let a = make_entry("a", "1", 0, 0, 960, 1080);
+        let b = make_entry("b", "1", 960, 0, 960, 1080);
+        let refs = vec![&a, &b];
+        let wp = build_workspace_plan(&refs, &[0, 1]).unwrap();
+        assert!(wp.pixel_ratio_steps.is_empty());
+    }
+
+    #[test]
+    fn pixel_ratio_steps_three_windows_right_heavy_has_none() {
+        // Root split has one direct leaf child (a); the other (b/c) is a
+        // Split, but that's still reachable by focusing a or b/c's leaf.
+        let a = make_entry("a", "1", 0, 0, 960, 1080);
+        let b = make_entry("b", "1", 960, 0, 960, 540);
+        let c = make_entry("c", "1", 960, 540, 960, 540);
+        let refs = vec![&a, &b, &c];
+        let wp = build_workspace_plan(&refs, &[0, 1, 2]).unwrap();
+        assert!(wp.pixel_ratio_steps.is_empty());
+    }
+
+    /// The 2x2 grid's root split has two Split children (each column is
+    /// itself a nested vertical split of two leaves) — neither is a direct
+    /// leaf, so this is exactly the split `collect_splitratio_steps` cannot
+    /// reach and that `apply_split_ratios` silently drops. This is the real-
+    /// reboot failure shape: 4 windows, 2 ratio_steps (the two column
+    /// splits), and one root split ratio previously left entirely
+    /// uncorrected — the flat per-leaf pixel-delta convergence that used to
+    /// run afterward had no way to express "the root split governing your
+    /// whole column is wrong," only "you personally are the wrong size."
+    #[test]
+    fn pixel_ratio_steps_capture_2x2_grid_root_split() {
+        let a0 = make_entry("Alacritty", "4", 2570, 45, 1464, 602);
+        let a1 = make_entry("Alacritty", "4", 2570, 657, 1464, 773);
+        let discord = make_entry("discord", "4", 4044, 45, 1066, 688);
+        let slack = make_entry("slack", "4", 4044, 743, 1066, 687);
+        let refs: Vec<&WindowEntry> = vec![&a0, &a1, &discord, &slack];
+
+        let wp = build_workspace_plan(&refs, &[0, 1, 2, 3]).unwrap();
+
+        assert_eq!(
+            wp.ratio_steps.len(),
+            2,
+            "only the two column splits are directly reachable via splitratio"
+        );
+        assert_eq!(
+            wp.pixel_ratio_steps.len(),
+            1,
+            "the root split (left column vs. right column) has no direct \
+             leaf child on either side and must surface as a \
+             pixel_ratio_steps entry"
+        );
+
+        let step = &wp.pixel_ratio_steps[0];
+        assert_eq!(step.dir, SplitDir::Horizontal, "columns split left/right");
+        assert!(
+            (step.ratio - 0.578).abs() < 0.01,
+            "left column (1464px) vs. right column (1066px) of a 2540px \
+             total span, got ratio {}",
+            step.ratio
+        );
+        assert_eq!(
+            step.first_leaf_idx, 0,
+            "a0, leftmost leaf of the left column"
+        );
+        assert_eq!(
+            step.second_leaf_idx, 2,
+            "discord, leftmost leaf of the right column"
+        );
     }
 }
