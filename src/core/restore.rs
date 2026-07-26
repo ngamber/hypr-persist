@@ -483,6 +483,8 @@ impl RestoreEngine {
 
         self.apply_split_ratios(ctl, &ws_plans, &addresses, &adopted)
             .await;
+        self.converge_split_ratios(&ws_plans, ctl, &addresses, &adopted)
+            .await;
         self.converge_tiled_sizes(session, ctl, &addresses, &adopted)
             .await;
         self.apply_fullscreen(session, ctl, &addresses, &adopted)
@@ -1094,6 +1096,146 @@ impl RestoreEngine {
             tracing::info!("applied {applied} split ratios");
             tokio::time::sleep(Duration::from_millis(30)).await;
         }
+    }
+
+    /// Correct BSP split nodes that `apply_split_ratios` cannot reach: those
+    /// whose two children are both internal sub-trees, so no single window
+    /// is directly parented by the split (see `dwindle::PixelRatioStep`).
+    /// `layoutmsg splitratio` only ever adjusts the currently focused
+    /// window's own immediate parent split, so these are unreachable that
+    /// way — but `resizewindowpixel` walks from the resized window up to
+    /// the nearest ancestor split matching the resize axis, so resizing the
+    /// leftmost leaf of one side by the delta needed to hit the split's
+    /// saved ratio reaches exactly this split. Only the split's own axis is
+    /// touched (the other delta is always 0) so this never also perturbs an
+    /// orthogonal ancestor split.
+    ///
+    /// Adopted windows are skipped on either side of the split, same reason
+    /// as `converge_tiled_sizes`: an adopted window's tree shape is already
+    /// live and shouldn't be nudged.
+    ///
+    /// Same one-candidate-per-pass and stuck-delta dedup invariants as
+    /// `converge_tiled_sizes`, for the same reason: resizing one split can
+    /// change the live geometry a later step measures, so issuing more than
+    /// one per pass risks the same shared-edge fight.
+    async fn converge_split_ratios(
+        &self,
+        ws_plans: &HashMap<String, DwindlePlan>,
+        ctl: &HyprCtl,
+        addresses: &HashMap<usize, String>,
+        adopted: &HashSet<usize>,
+    ) {
+        const TOLERANCE: i32 = 6;
+
+        let mut sorted_ws: Vec<&String> = ws_plans.keys().collect();
+        sorted_ws.sort();
+
+        let mut candidates: Vec<&dwindle::PixelRatioStep> = Vec::new();
+        for ws in sorted_ws {
+            for step in &ws_plans[ws].pixel_ratio_steps {
+                if adopted.contains(&step.first_leaf_idx) || adopted.contains(&step.second_leaf_idx)
+                {
+                    continue;
+                }
+                candidates.push(step);
+            }
+        }
+
+        if candidates.is_empty() {
+            return;
+        }
+
+        let max_passes = candidates.len() + 2;
+        let mut last_attempted: HashMap<(usize, usize), i32> = HashMap::new();
+
+        for pass in 0..max_passes {
+            let mut dispatched = false;
+            let mut any_out_of_tolerance = false;
+
+            for step in &candidates {
+                let key = (step.first_leaf_idx, step.second_leaf_idx);
+                let Some(first_addr) = addresses.get(&step.first_leaf_idx) else {
+                    continue;
+                };
+                let Some(second_addr) = addresses.get(&step.second_leaf_idx) else {
+                    continue;
+                };
+                let Ok(Some(first_client)) = ctl.get_client_by_address(first_addr).await else {
+                    continue;
+                };
+                let Ok(Some(second_client)) = ctl.get_client_by_address(second_addr).await else {
+                    continue;
+                };
+
+                let (first_extent, second_extent) = match step.dir {
+                    dwindle::SplitDir::Horizontal => (first_client.size.0, second_client.size.0),
+                    dwindle::SplitDir::Vertical => (first_client.size.1, second_client.size.1),
+                };
+                let total = first_extent + second_extent;
+                let target_first = (step.ratio * f64::from(total)).round() as i32;
+                let delta = target_first - first_extent;
+
+                if delta.abs() > TOLERANCE {
+                    any_out_of_tolerance = true;
+
+                    if last_attempted.get(&key) == Some(&delta) {
+                        tracing::debug!(
+                            "  pass {}: split ratio for ({}, {}) still off by {delta}, matching \
+                             the previous attempt — not re-dispatching, checking other \
+                             candidates",
+                            pass + 1,
+                            step.first_leaf_idx,
+                            step.second_leaf_idx,
+                        );
+                        continue;
+                    }
+
+                    tracing::debug!(
+                        "  pass {}: correct split ratio via ({}, {}) by {delta}",
+                        pass + 1,
+                        step.first_leaf_idx,
+                        step.second_leaf_idx,
+                    );
+                    last_attempted.insert(key, delta);
+
+                    let (dw, dh) = match step.dir {
+                        dwindle::SplitDir::Horizontal => (delta, 0),
+                        dwindle::SplitDir::Vertical => (0, delta),
+                    };
+                    match ctl
+                        .dispatch(&format!(
+                            "resizewindowpixel {dw} {dh},address:0x{first_addr}"
+                        ))
+                        .await
+                    {
+                        Ok(resp) if resp.trim() != "ok" => {
+                            tracing::warn!("  split-ratio resize failed: {resp}");
+                        }
+                        Err(e) => tracing::warn!("  split-ratio resize ipc error: {e}"),
+                        _ => {}
+                    }
+                    dispatched = true;
+                    break;
+                }
+            }
+
+            if !any_out_of_tolerance {
+                tracing::debug!("  split ratios converged after {} pass(es)", pass + 1);
+                return;
+            }
+
+            if !dispatched {
+                tracing::debug!(
+                    "  split ratios settled after {} pass(es); remaining candidates unchanged \
+                     since their last attempt",
+                    pass + 1
+                );
+                return;
+            }
+
+            tokio::time::sleep(Duration::from_millis(60)).await;
+        }
+        tracing::debug!("  split ratios settled after {max_passes} passes");
     }
 
     /// Adopted windows are skipped: they were already live before this
@@ -3094,6 +3236,7 @@ mod tests {
                     },
                 ],
                 ratio_steps: vec![],
+                pixel_ratio_steps: vec![],
             },
         );
 
@@ -3176,6 +3319,7 @@ mod tests {
                         ratio: 0.3,
                     },
                 ],
+                pixel_ratio_steps: vec![],
             },
         );
 
@@ -3513,6 +3657,257 @@ mod tests {
         assert_eq!(
             resize_count, 1,
             "an unchanging delta must only be dispatched once, got: {commands:?}"
+        );
+        drop(commands);
+
+        s1.abort();
+    }
+
+    // --- converge_split_ratios: internal-internal split correction ---
+
+    /// Regression test for the real-reboot failure: a 4-leaf tree shaped
+    /// like a 2x2 grid (two columns, each an independent split of two
+    /// leaves) has a root split whose *both* children are sub-trees, so no
+    /// window is directly parented by it and `layoutmsg splitratio` can
+    /// never reach it (see `pixel_ratio_steps_capture_2x2_grid_root_split`
+    /// in `dwindle.rs`). The old flat per-leaf `resizewindowpixel` diff in
+    /// `converge_tiled_sizes` had no way to express this — it only ever
+    /// compared one leaf's own saved absolute size against its live size,
+    /// with no notion of "your entire column's width comes from an
+    /// ancestor ratio that was never set." `converge_split_ratios` instead
+    /// derives the delta from the split's saved ratio and the current
+    /// combined extent of both sides, then resizes only the matching axis
+    /// (dh must stay 0 for a Horizontal split) via the leftmost leaf of one
+    /// side — the representative window whose nearest opposite-orientation
+    /// ancestor is exactly this split.
+    #[tokio::test]
+    async fn converge_split_ratios_corrects_root_split_unreachable_by_splitratio() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock1 = dir.path().join("s1.sock");
+        let sock2 = dir.path().join("s2.sock");
+
+        // Live: an even 760/760 column split (total 1520). Saved: a 0.6
+        // ratio, i.e. the left column should be 912px wide.
+        let clients_json = r#"[{"address":"0xa0001","class":"Alacritty","pid":1,
+            "workspace":{"id":4,"name":"4"},"monitor":0,
+            "at":[0,0],"size":[760,900],"floating":false,"fullscreen":0},
+            {"address":"0xdiscord1","class":"discord","pid":2,
+            "workspace":{"id":4,"name":"4"},"monitor":0,
+            "at":[770,0],"size":[760,900],"floating":false,"fullscreen":0}]"#
+            .to_string();
+
+        let (mock1, log, _clients) = RecordingSocket1::with_clients(&sock1, clients_json);
+        let s1 = tokio::spawn(mock1.serve());
+
+        let ctl = HyprCtl::new(HyprSocketPaths::new(sock1, sock2));
+        let engine = RestoreEngine::new(true, true);
+
+        let mut ws_plans = HashMap::new();
+        ws_plans.insert(
+            "4".to_string(),
+            DwindlePlan {
+                steps: vec![],
+                ratio_steps: vec![],
+                pixel_ratio_steps: vec![dwindle::PixelRatioStep {
+                    dir: dwindle::SplitDir::Horizontal,
+                    ratio: 0.6,
+                    first_leaf_idx: 0,
+                    second_leaf_idx: 2,
+                }],
+            },
+        );
+
+        let mut addresses = HashMap::new();
+        addresses.insert(0usize, "a0001".to_string());
+        addresses.insert(2usize, "discord1".to_string());
+        let adopted = HashSet::new();
+
+        engine
+            .converge_split_ratios(&ws_plans, &ctl, &addresses, &adopted)
+            .await;
+
+        let commands = log.lock().await;
+        let resizes: Vec<&String> = commands
+            .iter()
+            .filter(|c| c.contains("resizewindowpixel"))
+            .collect();
+        assert_eq!(
+            resizes.len(),
+            1,
+            "expected exactly one resize to correct the root split, got: {commands:?}"
+        );
+        assert!(
+            resizes[0].contains("resizewindowpixel 152 0,address:0xa0001"),
+            "expected a width-only (dh=0) correction of +152px on the left \
+             column's representative leaf (912 target - 760 live), got: {resizes:?}"
+        );
+        assert!(
+            !commands
+                .iter()
+                .any(|c| c.contains("address:0xdiscord1") && c.contains("resizewindowpixel")),
+            "the second side's representative leaf must never itself be \
+             resized, got: {commands:?}"
+        );
+        drop(commands);
+
+        s1.abort();
+    }
+
+    /// An adopted window on either side of an internal-internal split must
+    /// not be queried or resized — same reasoning as
+    /// `converge_tiled_sizes_skips_adopted_window`.
+    #[tokio::test]
+    async fn converge_split_ratios_skips_adopted_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock1 = dir.path().join("s1.sock");
+        let sock2 = dir.path().join("s2.sock");
+
+        let (mock1, log) = RecordingSocket1::new(&sock1);
+        let s1 = tokio::spawn(mock1.serve());
+
+        let ctl = HyprCtl::new(HyprSocketPaths::new(sock1, sock2));
+        let engine = RestoreEngine::new(true, true);
+
+        let mut ws_plans = HashMap::new();
+        ws_plans.insert(
+            "4".to_string(),
+            DwindlePlan {
+                steps: vec![],
+                ratio_steps: vec![],
+                pixel_ratio_steps: vec![dwindle::PixelRatioStep {
+                    dir: dwindle::SplitDir::Horizontal,
+                    ratio: 0.6,
+                    first_leaf_idx: 0,
+                    second_leaf_idx: 2,
+                }],
+            },
+        );
+
+        let mut addresses = HashMap::new();
+        addresses.insert(0usize, "adopted04".to_string());
+        addresses.insert(2usize, "fresh04".to_string());
+        let mut adopted = HashSet::new();
+        adopted.insert(0);
+
+        engine
+            .converge_split_ratios(&ws_plans, &ctl, &addresses, &adopted)
+            .await;
+
+        let commands = log.lock().await;
+        assert!(
+            commands.is_empty(),
+            "a split with an adopted window on either side must not be \
+             queried or resized at all, got: {commands:?}"
+        );
+        drop(commands);
+
+        s1.abort();
+    }
+
+    /// Two independent internal-internal splits (e.g. in different
+    /// workspaces) must never both be resized in the same pass, mirroring
+    /// `converge_tiled_sizes_never_resizes_two_shared_edge_windows_in_one_pass`:
+    /// resizing one split's representative leaf can change what a later
+    /// step measures, so serializing to one resize per pass avoids the same
+    /// fight. Both deltas here are permanently stuck (static mock
+    /// geometry), so the first candidate gets its one dispatch, is found
+    /// unchanged on the next pass, and only then does the second candidate
+    /// get its turn.
+    #[tokio::test]
+    async fn converge_split_ratios_never_resizes_two_splits_in_one_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock1 = dir.path().join("s1.sock");
+        let sock2 = dir.path().join("s2.sock");
+
+        let clients_json = r#"[{"address":"0xa0001","class":"Alacritty","pid":1,
+            "workspace":{"id":4,"name":"4"},"monitor":0,
+            "at":[0,0],"size":[760,900],"floating":false,"fullscreen":0},
+            {"address":"0xdiscord1","class":"discord","pid":2,
+            "workspace":{"id":4,"name":"4"},"monitor":0,
+            "at":[770,0],"size":[760,900],"floating":false,"fullscreen":0},
+            {"address":"0xwin4","class":"kitty","pid":3,
+            "workspace":{"id":5,"name":"5"},"monitor":0,
+            "at":[0,0],"size":[100,300],"floating":false,"fullscreen":0},
+            {"address":"0xwin6","class":"kitty","pid":4,
+            "workspace":{"id":5,"name":"5"},"monitor":0,
+            "at":[0,310],"size":[100,300],"floating":false,"fullscreen":0}]"#
+            .to_string();
+
+        let (mock1, log, _clients) = RecordingSocket1::with_clients(&sock1, clients_json);
+        let s1 = tokio::spawn(mock1.serve());
+
+        let ctl = HyprCtl::new(HyprSocketPaths::new(sock1, sock2));
+        let engine = RestoreEngine::new(true, true);
+
+        let mut ws_plans = HashMap::new();
+        ws_plans.insert(
+            "4".to_string(),
+            DwindlePlan {
+                steps: vec![],
+                ratio_steps: vec![],
+                pixel_ratio_steps: vec![dwindle::PixelRatioStep {
+                    dir: dwindle::SplitDir::Horizontal,
+                    ratio: 0.6,
+                    first_leaf_idx: 0,
+                    second_leaf_idx: 2,
+                }],
+            },
+        );
+        ws_plans.insert(
+            "5".to_string(),
+            DwindlePlan {
+                steps: vec![],
+                ratio_steps: vec![],
+                pixel_ratio_steps: vec![dwindle::PixelRatioStep {
+                    dir: dwindle::SplitDir::Vertical,
+                    ratio: 0.4,
+                    first_leaf_idx: 4,
+                    second_leaf_idx: 6,
+                }],
+            },
+        );
+
+        let mut addresses = HashMap::new();
+        addresses.insert(0usize, "a0001".to_string());
+        addresses.insert(2usize, "discord1".to_string());
+        addresses.insert(4usize, "win4".to_string());
+        addresses.insert(6usize, "win6".to_string());
+        let adopted = HashSet::new();
+
+        engine
+            .converge_split_ratios(&ws_plans, &ctl, &addresses, &adopted)
+            .await;
+
+        let commands = log.lock().await;
+        let resize_indices: Vec<usize> = commands
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.contains("resizewindowpixel"))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            resize_indices.len(),
+            2,
+            "expected exactly one resize each for the two independent \
+             splits (workspace 4 first, then workspace 5), got: {commands:?}"
+        );
+        let (first_idx, second_idx) = (resize_indices[0], resize_indices[1]);
+        assert!(
+            commands[first_idx].contains("address:0xa0001"),
+            "workspace 4's split must be corrected first (sorted before \
+             workspace 5), got: {commands:?}"
+        );
+        assert!(
+            commands[second_idx].contains("address:0xwin4"),
+            "workspace 5's split must be corrected second, got: {commands:?}"
+        );
+        assert!(
+            commands[first_idx + 1..second_idx]
+                .iter()
+                .any(|c| c.contains("j/clients")),
+            "workspace 5's split must never be resized in the same pass as \
+             workspace 4's — there must be a recheck confirming workspace \
+             4 is stuck before workspace 5 gets a turn, got: {commands:?}"
         );
         drop(commands);
 
@@ -3943,6 +4338,7 @@ mod tests {
                     },
                 ],
                 ratio_steps: vec![],
+                pixel_ratio_steps: vec![],
             },
         );
 
@@ -4093,6 +4489,7 @@ mod tests {
                     },
                 ],
                 ratio_steps: vec![],
+                pixel_ratio_steps: vec![],
             },
         );
 
