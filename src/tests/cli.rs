@@ -1,6 +1,6 @@
 /// CLI integration tests.
 ///
-/// These spawn the actual hyprresume binary and verify its output.
+/// These spawn the actual hypr-persist binary and verify its output.
 /// Commands that need Hyprland are expected to fail gracefully.
 #[cfg(test)]
 mod tests {
@@ -18,7 +18,7 @@ mod tests {
         let output = cargo_bin().arg("--help").output().unwrap();
         assert!(output.status.success());
         let stdout = String::from_utf8(output.stdout).unwrap();
-        assert!(stdout.contains("hyprresume"));
+        assert!(stdout.contains("hypr-persist"));
         assert!(stdout.contains("save"));
         assert!(stdout.contains("restore"));
         assert!(stdout.contains("list"));
@@ -32,8 +32,8 @@ mod tests {
         let output = cargo_bin().arg("--version").output().unwrap();
         assert!(output.status.success());
         let stdout = String::from_utf8(output.stdout).unwrap();
-        assert!(stdout.contains("hyprresume"));
-        assert!(stdout.contains("0.5.0"));
+        assert!(stdout.contains("hypr-persist"));
+        assert!(stdout.contains("0.1.0"));
     }
 
     #[test]

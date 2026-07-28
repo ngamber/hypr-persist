@@ -65,7 +65,7 @@ pub fn translate_dispatch(args: &str) -> Result<String> {
         }
         // Confirmed: hl.dsp.window.move({ window = .., x = .., y = .. }) sets
         // absolute pixel position (the "+relative" flag is opt-in, so the
-        // default matches classic `movewindowpixel exact`). hyprresume only
+        // default matches classic `movewindowpixel exact`). hypr-persist only
         // ever calls this with `exact`, so the prefix is stripped and ignored.
         "movewindowpixel" => {
             let rest = rest.strip_prefix("exact ").unwrap_or(rest);
