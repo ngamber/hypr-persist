@@ -1,0 +1,35 @@
+# Maintainer: Nathan Gamber <ngamber@gmail.com>
+pkgname=hypr-persist
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Session persistence daemon for Hyprland'
+arch=('x86_64')
+url='https://github.com/ngamber/hypr-persist'
+license=('BSD-3-Clause')
+depends=('gcc-libs')
+makedepends=('cargo' 'mold')
+install=$pkgname.install
+options=(!debug)
+source=("$pkgname-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz")
+# TODO: replace once the v0.1.0 tag is pushed and the release tarball exists —
+# compute with: curl -sL "$url/archive/v$pkgver.tar.gz" | sha256sum
+sha256sums=('SKIP')
+
+prepare() {
+    cd "$pkgname-$pkgver"
+    export RUSTUP_TOOLCHAIN=stable
+    cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+    cd "$pkgname-$pkgver"
+    export RUSTUP_TOOLCHAIN=stable
+    export CARGO_TARGET_DIR=target
+    cargo build --frozen --release
+}
+
+package() {
+    cd "$pkgname-$pkgver"
+    install -Dm755 "target/release/$pkgname" "$pkgdir/usr/bin/$pkgname"
+    install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}
