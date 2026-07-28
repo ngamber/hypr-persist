@@ -11,9 +11,7 @@ makedepends=('cargo' 'mold')
 install=$pkgname.install
 options=(!debug)
 source=("$pkgname-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz")
-# TODO: replace once the v0.1.0 tag is pushed and the release tarball exists —
-# compute with: curl -sL "$url/archive/v$pkgver.tar.gz" | sha256sum
-sha256sums=('SKIP')
+sha256sums=('41b97f7d620234a3e533d69cb52d03880b52ca6c6415a54810173a15d015212d')
 
 prepare() {
     cd "$pkgname-$pkgver"
