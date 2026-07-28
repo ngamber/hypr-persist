@@ -57,7 +57,7 @@ const fn default_save_interval() -> u64 {
 }
 
 fn default_session_dir() -> String {
-    "~/.local/share/hyprresume".to_string()
+    "~/.local/share/hypr-persist".to_string()
 }
 
 const fn default_true() -> bool {
@@ -102,7 +102,7 @@ impl Config {
         dirs::config_dir()
             .unwrap_or_else(|| PathBuf::from("~/.config"))
             .join("hypr")
-            .join("hyprresume.toml")
+            .join("hypr-persist.toml")
     }
 
     pub fn session_dir(&self) -> PathBuf {
@@ -148,7 +148,7 @@ mod tests {
 
     #[test]
     fn load_missing_file_returns_defaults() {
-        let cfg = Config::load(Some("/tmp/nonexistent-hyprresume-test-config.toml")).unwrap();
+        let cfg = Config::load(Some("/tmp/nonexistent-hypr-persist-test-config.toml")).unwrap();
         assert_eq!(cfg.general.save_interval, 120);
     }
 

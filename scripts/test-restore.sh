@@ -7,7 +7,7 @@ SESSION="${1:-test-restore}"
 
 echo "=== Building latest code ==="
 cargo build --release --manifest-path "$PROJECT_DIR/Cargo.toml"
-BIN="$PROJECT_DIR/target/release/hyprresume"
+BIN="$PROJECT_DIR/target/release/hypr-persist"
 
 echo ""
 echo "=== Saving session '$SESSION' ==="
@@ -15,7 +15,7 @@ echo "=== Saving session '$SESSION' ==="
 
 echo ""
 echo "=== Saved session content ==="
-cat ~/.local/share/hyprresume/sessions/"$SESSION".toml
+cat ~/.local/share/hypr-persist/sessions/"$SESSION".toml
 
 echo ""
 echo "=== Closing all windows and restoring in 3s (detached) ==="
@@ -25,6 +25,6 @@ nohup bash -c "
     hyprctl clients -j | jq -r '.[].address' | xargs -I{} hyprctl dispatch closewindow address:{}
     sleep 3
     '$BIN' -vv restore '$SESSION'
-" > /tmp/hyprresume-test.log 2>&1 &
+" > /tmp/hypr-persist-test.log 2>&1 &
 
-echo "Detached. Output in /tmp/hyprresume-test.log"
+echo "Detached. Output in /tmp/hypr-persist-test.log"

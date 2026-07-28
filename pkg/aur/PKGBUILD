@@ -1,17 +1,19 @@
-# Maintainer: Adrien Lenoir <adrien.lenoir42440@gmail.com>
-pkgname=hyprresume
-pkgver=0.5.0
+# Maintainer: Nathan Gamber <ngamber@gmail.com>
+pkgname=hypr-persist
+pkgver=0.1.0
 pkgrel=1
 pkgdesc='Session persistence daemon for Hyprland'
 arch=('x86_64')
-url='https://github.com/IraSkyx/hyprresume'
+url='https://github.com/ngamber/hypr-persist'
 license=('BSD-3-Clause')
 depends=('gcc-libs')
 makedepends=('cargo' 'mold')
 install=$pkgname.install
 options=(!debug)
 source=("$pkgname-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz")
-sha256sums=('efbfe4d1a75a0d78969332d163e9f40a18d3d0033b5d85d1a90f8ffdf1017935')
+# TODO: replace once the v0.1.0 tag is pushed and the release tarball exists —
+# compute with: curl -sL "$url/archive/v$pkgver.tar.gz" | sha256sum
+sha256sums=('SKIP')
 
 prepare() {
     cd "$pkgname-$pkgver"

@@ -12,7 +12,7 @@ use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
 #[command(
-    name = "hyprresume",
+    name = "hypr-persist",
     version,
     about = "Session persistence daemon for Hyprland"
 )]
@@ -73,7 +73,7 @@ fn init_logging(verbose: u8, quiet: bool) {
         }
     };
 
-    let filter = format!("hyprresume={level}");
+    let filter = format!("hypr_persist={level}");
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -92,7 +92,10 @@ async fn main() -> Result<()> {
 
     match cli.command {
         None => {
-            tracing::info!("starting hyprresume daemon v{}", env!("CARGO_PKG_VERSION"));
+            tracing::info!(
+                "starting hypr-persist daemon v{}",
+                env!("CARGO_PKG_VERSION")
+            );
             core::daemon::run(cfg).await?;
         }
 

@@ -8,7 +8,7 @@ sessions to disk and restores them on next login.
 
 ```
 ┌──────────────────────────────────────────────────────┐
-│                      hyprresume                      │
+│                      hypr-persist                      │
 │                                                      │
 │  ┌──────────────┐  ┌──────────────┐  ┌───────────┐  │
 │  │ Event Listener│─▶│ State Manager│─▶│ Snapshot  │  │
@@ -63,7 +63,7 @@ Results are cached per window class.
 
 ### Config (`src/config.rs`)
 
-TOML at `~/.config/hypr/hyprresume.toml`. Handles save interval, session directory, exclude patterns, per-class overrides, restore options.
+TOML at `~/.config/hypr/hypr-persist.toml`. Handles save interval, session directory, exclude patterns, per-class overrides, restore options.
 
 ### Models (`src/models.rs`)
 

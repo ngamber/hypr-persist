@@ -152,11 +152,11 @@ impl LiveWindowPool {
     /// that didn't exist at daemon startup and hasn't already been claimed.
     /// Catches an app that opened independently sometime after the startup
     /// snapshot was taken — an autostart entry can race ahead of, or during,
-    /// hyprresume's own restore sequence. Two failure modes this fixes:
+    /// hypr-persist's own restore sequence. Two failure modes this fixes:
     /// the class's `OpenWindow` event arrived while a different window's
     /// `wait_for_open_event` call was still draining events (and silently
     /// discarded it, since that loop only keeps events matching its own
-    /// class), or the app is effectively single-instance and hyprresume's
+    /// class), or the app is effectively single-instance and hypr-persist's
     /// own `exec` for it just activates the existing window without
     /// emitting a fresh event at all — either way, no timeout duration would
     /// let `wait_for_open_event` ever succeed for it.
@@ -892,7 +892,7 @@ impl RestoreEngine {
         }
 
         let rule_name = format!(
-            "hyprresume-{}-{}",
+            "hypr-persist-{}-{}",
             window.app_id.replace(['.', ' '], "-"),
             rule_counter
         );
@@ -1459,7 +1459,7 @@ impl RestoreEngine {
         }
 
         let rule_name = format!(
-            "hyprresume-{}-{}",
+            "hypr-persist-{}-{}",
             window.app_id.replace(['.', ' '], "-"),
             active_rules.len()
         );
@@ -2240,10 +2240,10 @@ mod tests {
             fullscreen: false,
             position: None,
             size: None,
-            rule_name: "hyprresume-slow-app".to_string(),
+            rule_name: "hypr-persist-slow-app".to_string(),
             placement: PlacementHint::None,
         }];
-        let all_rules = vec!["hyprresume-slow-app".to_string()];
+        let all_rules = vec!["hypr-persist-slow-app".to_string()];
 
         watch_late_windows(paths, pending, all_rules, false, Duration::from_secs(5)).await;
 
@@ -2258,7 +2258,7 @@ mod tests {
 
         let has_rule_disable = commands
             .iter()
-            .any(|c| c.contains("windowrule[hyprresume-slow-app]:enable false"));
+            .any(|c| c.contains("windowrule[hypr-persist-slow-app]:enable false"));
         assert!(has_rule_disable, "expected rule cleanup, got: {commands:?}");
         drop(commands);
 
@@ -2296,13 +2296,13 @@ mod tests {
             fullscreen: false,
             position: None,
             size: None,
-            rule_name: "hyprresume-slack".to_string(),
+            rule_name: "hypr-persist-slack".to_string(),
             placement: PlacementHint::DwindleAnchor(
                 "anchor789".to_string(),
                 dwindle::PreselDir::Bottom,
             ),
         }];
-        let all_rules = vec!["hyprresume-slack".to_string()];
+        let all_rules = vec!["hypr-persist-slack".to_string()];
 
         watch_late_windows(paths, pending, all_rules, false, Duration::from_secs(5)).await;
 
@@ -2368,10 +2368,10 @@ mod tests {
             fullscreen: false,
             position: None,
             size: None,
-            rule_name: "hyprresume-thunar".to_string(),
+            rule_name: "hypr-persist-thunar".to_string(),
             placement: PlacementHint::MasterPromote,
         }];
-        let all_rules = vec!["hyprresume-thunar".to_string()];
+        let all_rules = vec!["hypr-persist-thunar".to_string()];
 
         watch_late_windows(paths, pending, all_rules, false, Duration::from_secs(5)).await;
 
@@ -2420,10 +2420,10 @@ mod tests {
             fullscreen: false,
             position: None,
             size: None,
-            rule_name: "hyprresume-kitty".to_string(),
+            rule_name: "hypr-persist-kitty".to_string(),
             placement: PlacementHint::None,
         }];
-        let all_rules = vec!["hyprresume-kitty".to_string()];
+        let all_rules = vec!["hypr-persist-kitty".to_string()];
 
         watch_late_windows(paths, pending, all_rules, false, Duration::from_secs(5)).await;
 
@@ -2471,10 +2471,10 @@ mod tests {
             fullscreen: false,
             position: None,
             size: None,
-            rule_name: "hyprresume-missing-app".to_string(),
+            rule_name: "hypr-persist-missing-app".to_string(),
             placement: PlacementHint::None,
         }];
-        let all_rules = vec!["hyprresume-missing-app".to_string()];
+        let all_rules = vec!["hypr-persist-missing-app".to_string()];
 
         let start = tokio::time::Instant::now();
         watch_late_windows(paths, pending, all_rules, false, Duration::from_millis(300)).await;
@@ -2488,7 +2488,7 @@ mod tests {
         let commands = log.lock().await;
         let has_rule_disable = commands
             .iter()
-            .any(|c| c.contains("windowrule[hyprresume-missing-app]:enable false"));
+            .any(|c| c.contains("windowrule[hypr-persist-missing-app]:enable false"));
         assert!(
             has_rule_disable,
             "rules must be cleaned up even on timeout, got: {commands:?}"
@@ -2532,10 +2532,10 @@ mod tests {
             fullscreen: false,
             position: Some((200, 150)),
             size: Some((800, 600)),
-            rule_name: "hyprresume-floater".to_string(),
+            rule_name: "hypr-persist-floater".to_string(),
             placement: PlacementHint::None,
         }];
-        let all_rules = vec!["hyprresume-floater".to_string()];
+        let all_rules = vec!["hypr-persist-floater".to_string()];
 
         watch_late_windows(paths, pending, all_rules, true, Duration::from_secs(5)).await;
 
@@ -2599,7 +2599,7 @@ mod tests {
                 fullscreen: false,
                 position: None,
                 size: None,
-                rule_name: "hyprresume-app-a".to_string(),
+                rule_name: "hypr-persist-app-a".to_string(),
                 placement: PlacementHint::None,
             },
             PendingWindow {
@@ -2609,13 +2609,13 @@ mod tests {
                 fullscreen: false,
                 position: None,
                 size: None,
-                rule_name: "hyprresume-app-b".to_string(),
+                rule_name: "hypr-persist-app-b".to_string(),
                 placement: PlacementHint::None,
             },
         ];
         let all_rules = vec![
-            "hyprresume-app-a".to_string(),
-            "hyprresume-app-b".to_string(),
+            "hypr-persist-app-a".to_string(),
+            "hypr-persist-app-b".to_string(),
         ];
 
         let start = tokio::time::Instant::now();
@@ -4047,7 +4047,7 @@ mod tests {
 
     // --- racing-autostart adoption in bsp_launch_and_track ---
 
-    /// If the app is already live (racing autostart) before hyprresume even
+    /// If the app is already live (racing autostart) before hypr-persist even
     /// attempts to launch it, adopt it directly: no window rule, no `exec`.
     #[tokio::test]
     async fn bsp_launch_and_track_adopts_racing_window_before_exec() {

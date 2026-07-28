@@ -1,11 +1,11 @@
 [package]
-name = "hyprresume"
-version = "0.5.0"
+name = "hypr-persist"
+version = "0.1.0"
 edition = "2024"
 description = "An event-driven session persistence daemon for Hyprland"
 license = "BSD-3-Clause"
-repository = "https://github.com/IraSkyx/hyprresume"
-keywords = ["hyprland", "wayland", "session", "resume"]
+repository = "https://github.com/ngamber/hypr-persist"
+keywords = ["hyprland", "wayland", "session", "persist"]
 categories = ["command-line-utilities"]
 
 [dependencies]

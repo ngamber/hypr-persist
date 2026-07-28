@@ -170,7 +170,7 @@ mod tests {
         Config {
             general: GeneralConfig {
                 save_interval: 60,
-                session_dir: "/tmp/hyprresume-test".into(),
+                session_dir: "/tmp/hypr-persist-test".into(),
                 restore_on_start: false,
                 per_window_launch: false,
                 restore_geometry: false,

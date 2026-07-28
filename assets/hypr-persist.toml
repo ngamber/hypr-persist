@@ -1,12 +1,12 @@
-# hyprresume — session persistence for Hyprland
-# Place this file at ~/.config/hypr/hyprresume.toml
+# hypr-persist — session persistence for Hyprland
+# Place this file at ~/.config/hypr/hypr-persist.toml
 
 [general]
 # Seconds between automatic session snapshots
 save_interval = 120
 
 # Where session files are stored
-session_dir = "~/.local/share/hyprresume"
+session_dir = "~/.local/share/hypr-persist"
 
 # Automatically restore the "last" session on daemon start
 restore_on_start = true
