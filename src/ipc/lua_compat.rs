@@ -99,7 +99,7 @@ pub fn translate_dispatch(args: &str) -> Result<String> {
         // hl.dsp.layout("togglesplit") was empirically confirmed to behave
         // identically to `layoutmsg togglesplit`, so the same passthrough is
         // used for preselect/splitratio/orientation*/addmaster/etc.
-        "layoutmsg" => Ok(format!(r#"hl.dsp.layout({})"#, lua_quote(rest))),
+        "layoutmsg" => Ok(format!(r"hl.dsp.layout({})", lua_quote(rest))),
         // Confirmed: hl.dsp.workspace.move({ workspace = .., monitor = .. })
         "moveworkspacetomonitor" => {
             let (ws, monitor) = rest.split_once(' ').ok_or_else(|| {
