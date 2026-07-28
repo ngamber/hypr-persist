@@ -11,7 +11,7 @@ pub struct StateManager {
     include_patterns: Vec<Regex>,
 }
 
-pub(crate) fn normalize_address(addr: &str) -> String {
+pub fn normalize_address(addr: &str) -> String {
     addr.trim_start_matches("0x").to_lowercase()
 }
 
@@ -403,7 +403,7 @@ mod tests {
         state.add(make_window("0xabc", "firefox", "1"));
 
         let clients = vec![make_client("0xabc", "4", 1, (2570, 100))];
-        let monitor_map: HashMap<i64, String> = [(1, "DP-3".to_string())].into_iter().collect();
+        let monitor_map: HashMap<i64, String> = std::iter::once((1, "DP-3".to_string())).collect();
 
         state.refresh_geometry(&clients, &monitor_map);
 
@@ -426,7 +426,7 @@ mod tests {
         // shape of a workspace-to-monitor move landing between the two
         // separate hyprctl calls.
         let clients = vec![make_client("0xabc", "4", 2, (2570, 100))];
-        let monitor_map: HashMap<i64, String> = [(1, "DP-1".to_string())].into_iter().collect();
+        let monitor_map: HashMap<i64, String> = std::iter::once((1, "DP-1".to_string())).collect();
 
         state.refresh_geometry(&clients, &monitor_map);
 
