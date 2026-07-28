@@ -222,7 +222,7 @@ impl RestoreEngine {
     /// Shorten the window-appear timeout so tests can exercise the
     /// timeout-recheck path without a real 15s wait.
     #[cfg(test)]
-    fn with_window_appear_timeout(mut self, timeout: Duration) -> Self {
+    const fn with_window_appear_timeout(mut self, timeout: Duration) -> Self {
         self.window_appear_timeout = timeout;
         self
     }
@@ -520,7 +520,7 @@ impl RestoreEngine {
 
     /// Master layout restore: infer master/stack split, set orientation and
     /// mfact, open master windows first then stack windows.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     async fn restore_master(
         &self,
         session: &SessionFile,
@@ -1172,6 +1172,9 @@ impl RestoreEngine {
                     dwindle::SplitDir::Vertical => (first_client.size.1, second_client.size.1),
                 };
                 let total = first_extent + second_extent;
+                // Window pixel extents never approach i32::MAX, so the rounded
+                // ratio product can't truncate in practice.
+                #[allow(clippy::cast_possible_truncation)]
                 let target_first = (step.ratio * f64::from(total)).round() as i32;
                 let delta = target_first - first_extent;
 
@@ -1429,7 +1432,7 @@ impl RestoreEngine {
     /// subsequent window of the same class never sees a stale rule. Only
     /// rules for timed-out windows are kept alive (pushed to `active_rules`)
     /// for the background late-window watcher.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     async fn launch_and_track(
         &self,
         window: &WindowEntry,
@@ -3077,7 +3080,7 @@ mod tests {
 
     // --- restore_window adoption ---
 
-    /// When a live window matches, restore_window must adopt it instead of
+    /// When a live window matches, `restore_window` must adopt it instead of
     /// launching a duplicate: no window rule, no exec, no geometry dispatch.
     #[tokio::test]
     async fn restore_window_adopts_live_window_without_dispatch() {
@@ -3124,7 +3127,7 @@ mod tests {
         s1.abort();
     }
 
-    /// With no matching live window, restore_window falls back to the
+    /// With no matching live window, `restore_window` falls back to the
     /// existing launch-and-track behavior.
     #[tokio::test]
     async fn restore_window_launches_when_no_live_match() {
@@ -3182,7 +3185,7 @@ mod tests {
 
     // --- execute_bsp_plans adoption ---
 
-    /// When the first BSP step's window is already live, execute_bsp_plans
+    /// When the first BSP step's window is already live, `execute_bsp_plans`
     /// must adopt it without touching the workspace-switch dispatch normally
     /// issued for an anchor-less first step, and later steps must anchor
     /// against the adopted window's (normalized) address.
@@ -4423,6 +4426,7 @@ mod tests {
     /// and could swallow it first, an artifact of the single shared channel
     /// rather than of the bug under test.
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn execute_bsp_plans_finalizes_anchor_placement_after_delayed_open_with_intervening_close()
      {
         let dir = tempfile::tempdir().unwrap();

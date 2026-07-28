@@ -737,7 +737,7 @@ mod tests {
     /// itself a nested vertical split of two leaves) — neither is a direct
     /// leaf, so this is exactly the split `collect_splitratio_steps` cannot
     /// reach and that `apply_split_ratios` silently drops. This is the real-
-    /// reboot failure shape: 4 windows, 2 ratio_steps (the two column
+    /// reboot failure shape: 4 windows, 2 `ratio_steps` (the two column
     /// splits), and one root split ratio previously left entirely
     /// uncorrected — the flat per-leaf pixel-delta convergence that used to
     /// run afterward had no way to express "the root split governing your
