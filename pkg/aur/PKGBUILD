@@ -1,6 +1,6 @@
 # Maintainer: Nathan Gamber <ngamber@gmail.com>
 pkgname=hypr-persist
-pkgver=0.1.0
+pkgver=0.1.1
 pkgrel=1
 pkgdesc='Session persistence daemon for Hyprland'
 arch=('x86_64')
@@ -11,7 +11,9 @@ makedepends=('cargo' 'mold')
 install=$pkgname.install
 options=(!debug)
 source=("$pkgname-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz")
-sha256sums=('41b97f7d620234a3e533d69cb52d03880b52ca6c6415a54810173a15d015212d')
+# TODO: replace once the v0.1.1 tag is pushed and the release tarball exists —
+# compute with: curl -sL "$url/archive/v$pkgver.tar.gz" | sha256sum
+sha256sums=('SKIP')
 
 prepare() {
     cd "$pkgname-$pkgver"
