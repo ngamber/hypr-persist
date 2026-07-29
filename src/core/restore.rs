@@ -1246,17 +1246,22 @@ impl RestoreEngine {
     /// them toward the saved size fights the tree's actual layout instead of
     /// correcting anything (observed: a window driven to near-zero size).
     ///
+    /// Resizes dispatch the saved *absolute* size (`resizewindowpixel exact`)
+    /// rather than a delta computed from the current live size. A relative
+    /// delta was live-tested and observed to get rejected as "Invalid size"
+    /// for small, entirely reasonable-looking deltas, then — once some other
+    /// candidate's resize perturbed the shared split — escalate to a wildly
+    /// larger delta on the next pass instead of correcting anything. An
+    /// absolute target sidesteps both failure modes: it's always the same
+    /// request regardless of how the live tree got perturbed in between.
+    ///
     /// At most one window is resized per pass. `resizewindowpixel` walks up
     /// the BSP tree to the nearest ancestor split matching each axis, so
     /// correcting one window's width or height can silently correct a
-    /// sibling sharing that same ancestor split too. Issuing independent
-    /// resizes for two such windows in the same pass fights over that shared
-    /// edge from both sides at once — live-tested and observed to reject
-    /// both with "Invalid size" and, over several passes, escalate rather
-    /// than converge. Serializing to one resize per pass means a sibling
-    /// whose mismatch was resolved as a side effect simply reads as already
-    /// converged next pass, and only genuinely independent windows consume
-    /// their own pass.
+    /// sibling sharing that same ancestor split too. Serializing to one
+    /// resize per pass means a sibling whose mismatch was resolved as a side
+    /// effect simply reads as already converged next pass, and only
+    /// genuinely independent windows consume their own pass.
     async fn converge_tiled_sizes(
         &self,
         session: &SessionFile,
@@ -1281,14 +1286,12 @@ impl RestoreEngine {
         // its own pass, plus room for a couple of settling passes.
         let max_passes = candidates.len() + 2;
 
-        // Tracks the last delta dispatched for each candidate so an
-        // unchanging live size (e.g. a resize Hyprland keeps rejecting)
-        // doesn't get the identical dispatch re-issued, and re-warned about,
-        // on every subsequent pass. Observed live: a resize computing the
-        // same (dw, dh) on every pass, rejected as "Invalid size" each time,
-        // yet the final live geometry matched the saved session exactly —
-        // i.e. a repeat of the same input can only repeat the same doomed
-        // outcome, so it's demoted to debug instead of warning every pass.
+        // Tracks the live mismatch observed at each candidate's last dispatch
+        // so an unchanging live size (the resize had no effect, whatever the
+        // reason) doesn't get an identical dispatch re-issued, and re-warned
+        // about, on every subsequent pass. If a sibling's resize perturbs
+        // this candidate again later, the recomputed mismatch will differ
+        // from what's stored here and a fresh dispatch goes out.
         let mut last_attempted: HashMap<usize, (i32, i32)> = HashMap::new();
 
         for pass in 0..max_passes {
@@ -1321,13 +1324,16 @@ impl RestoreEngine {
                     }
 
                     tracing::debug!(
-                        "  pass {}: resize {} by ({dw}, {dh})",
+                        "  pass {}: resizing {} to exact {saved_w}x{saved_h} \
+                         (currently off by ({dw}, {dh}))",
                         pass + 1,
                         window.app_id,
                     );
                     last_attempted.insert(*idx, (dw, dh));
                     match ctl
-                        .dispatch(&format!("resizewindowpixel {dw} {dh},address:0x{addr}"))
+                        .dispatch(&format!(
+                            "resizewindowpixel exact {saved_w} {saved_h},address:0x{addr}"
+                        ))
                         .await
                     {
                         Ok(resp) if resp.trim() != "ok" => {
@@ -3661,6 +3667,157 @@ mod tests {
             resize_count, 1,
             "an unchanging delta must only be dispatched once, got: {commands:?}"
         );
+        drop(commands);
+
+        s1.abort();
+    }
+
+    /// Regression test for the real-reboot failure that motivated switching
+    /// from a relative delta to an absolute target: a resize computed from
+    /// the live size (`resizewindowpixel {dw} {dh}`) was observed to get
+    /// rejected as "Invalid size" for small, ordinary-looking deltas like
+    /// (4, -11). The dispatch must instead always be the saved absolute
+    /// size via `resizewindowpixel exact`, which is immune to that
+    /// rejection and to compounding across passes.
+    #[tokio::test]
+    async fn converge_tiled_sizes_dispatches_absolute_exact_size_not_relative_delta() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock1 = dir.path().join("s1.sock");
+        let sock2 = dir.path().join("s2.sock");
+
+        let clients_json = r#"[{"address":"0xdiscor1","class":"discord","pid":1,
+            "workspace":{"id":4,"name":"4"},"monitor":0,
+            "at":[2570,45],"size":[120,62],"floating":false,"fullscreen":0}]"#
+            .to_string();
+
+        let (mock1, log, _clients) = RecordingSocket1::with_clients(&sock1, clients_json);
+        let s1 = tokio::spawn(mock1.serve());
+
+        let ctl = HyprCtl::new(HyprSocketPaths::new(sock1, sock2));
+        let engine = RestoreEngine::new(true, true);
+
+        let mut window = entry_with_position("discord", "4", (2570, 45));
+        window.size = Some((1269, 660));
+        let session = SessionFile {
+            session: crate::models::SessionMeta {
+                name: "t".to_string(),
+                timestamp: 0,
+            },
+            windows: vec![window],
+        };
+
+        let mut addresses = HashMap::new();
+        addresses.insert(0usize, "discor1".to_string());
+        let adopted = HashSet::new();
+
+        engine
+            .converge_tiled_sizes(&session, &ctl, &addresses, &adopted)
+            .await;
+
+        let commands = log.lock().await;
+        let resize_cmd = commands
+            .iter()
+            .find(|c| c.contains("resizewindowpixel"))
+            .unwrap_or_else(|| panic!("expected a resize dispatch, got: {commands:?}"));
+        assert!(
+            resize_cmd.contains("resizewindowpixel exact 1269 660,address:0xdiscor1"),
+            "resize must request the saved absolute size via `exact`, not a delta \
+             computed from the live size, got: {resize_cmd:?}"
+        );
+        drop(commands);
+
+        s1.abort();
+    }
+
+    /// Regression test for the cascading-escalation failure observed live:
+    /// after a sibling's resize perturbed a shared BSP split, the next
+    /// pass's *relative* delta for an already-attempted window ballooned
+    /// (e.g. from (4, -11) to (1149, 598)) instead of correcting anything,
+    /// because it was computed from whatever the live size had drifted to
+    /// rather than the saved target. Simulates that drift directly: after
+    /// the window's first resize is dispatched, its live geometry is
+    /// mutated to something else out of tolerance (standing in for a
+    /// sibling's side effect), forcing a second dispatch. That second
+    /// dispatch must request the exact same absolute target as the first —
+    /// proving the request is invariant to how badly the live tree drifted
+    /// in between, unlike a relative delta would be.
+    #[tokio::test]
+    async fn converge_tiled_sizes_repeat_dispatch_after_drift_targets_same_absolute_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock1 = dir.path().join("s1.sock");
+        let sock2 = dir.path().join("s2.sock");
+
+        let initial_json = r#"[{"address":"0xdiscor1","class":"discord","pid":1,
+            "workspace":{"id":4,"name":"4"},"monitor":0,
+            "at":[2570,45],"size":[120,62],"floating":false,"fullscreen":0}]"#
+            .to_string();
+        // Stands in for a sibling's resize cascading through the shared BSP
+        // split: a totally different out-of-tolerance size, not a step
+        // closer to the target.
+        let drifted_json = r#"[{"address":"0xdiscor1","class":"discord","pid":1,
+            "workspace":{"id":4,"name":"4"},"monitor":0,
+            "at":[2570,45],"size":[1149,598],"floating":false,"fullscreen":0}]"#
+            .to_string();
+
+        let (mock1, log, clients) = RecordingSocket1::with_clients(&sock1, initial_json);
+        let s1 = tokio::spawn(mock1.serve());
+
+        let watcher_log = log.clone();
+        let watcher = tokio::spawn(async move {
+            loop {
+                let seen = watcher_log
+                    .lock()
+                    .await
+                    .iter()
+                    .any(|c| c.contains("resizewindowpixel"));
+                if seen {
+                    *clients.lock().await = drifted_json;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+
+        let ctl = HyprCtl::new(HyprSocketPaths::new(sock1, sock2));
+        let engine = RestoreEngine::new(true, true);
+
+        let mut window = entry_with_position("discord", "4", (2570, 45));
+        window.size = Some((1269, 660));
+        let session = SessionFile {
+            session: crate::models::SessionMeta {
+                name: "t".to_string(),
+                timestamp: 0,
+            },
+            windows: vec![window],
+        };
+
+        let mut addresses = HashMap::new();
+        addresses.insert(0usize, "discor1".to_string());
+        let adopted = HashSet::new();
+
+        engine
+            .converge_tiled_sizes(&session, &ctl, &addresses, &adopted)
+            .await;
+
+        watcher.abort();
+
+        let commands = log.lock().await;
+        let resize_cmds: Vec<&String> = commands
+            .iter()
+            .filter(|c| c.contains("resizewindowpixel"))
+            .collect();
+        assert_eq!(
+            resize_cmds.len(),
+            2,
+            "expected the drift to trigger a second dispatch, got: {commands:?}"
+        );
+        for cmd in &resize_cmds {
+            assert!(
+                cmd.contains("resizewindowpixel exact 1269 660,address:0xdiscor1"),
+                "every dispatch must target the same saved absolute size \
+                 regardless of how the live size drifted in between, got: {cmd:?}"
+            );
+        }
         drop(commands);
 
         s1.abort();
