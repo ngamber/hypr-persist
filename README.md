@@ -12,6 +12,12 @@ substantially reworked since (see `LICENSE` for attribution).
 
 ## Install
 
+**Arch Linux (AUR):**
+
+```sh
+paru -S hypr-persist    # or yay, etc.
+```
+
 **From source:**
 
 ```sh
