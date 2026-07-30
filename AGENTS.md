@@ -55,8 +55,8 @@ add blanket allows elsewhere.
 
 ## Release process
 
-Version bumps follow a strict three-commit pattern (see history for `v0.1.0`/`v0.1.1`).
-Do all three steps as separate PRs/commits, in this order:
+Version bumps follow a strict four-step pattern (see history for `v0.1.0`/`v0.1.1`).
+Do steps 1-3 as separate PRs/commits, in this order:
 
 1. `chore: bump version to X.Y.Z` — update `Cargo.toml`, run `cargo build` to refresh
    `Cargo.lock`'s version entry, and update the hardcoded version string asserted in
@@ -67,6 +67,12 @@ Do all three steps as separate PRs/commits, in this order:
 3. After merging, tag `vX.Y.Z` (annotated, `git tag -a`) on `main` and push the tag. Then
    compute the real hash — `curl -sL "$url/archive/vX.Y.Z.tar.gz" | sha256sum` — and open
    `chore: fill in sha256sum for the vX.Y.Z release tarball`, replacing `SKIP`.
+4. Publish to AUR — this repo's `pkg/aur/PKGBUILD` is the source of truth, but it isn't
+   what `pacman`/AUR helpers install from. Clone `ssh://aur@aur.archlinux.org/hypr-persist.git`
+   separately, copy in the finalized `PKGBUILD` from step 3, regenerate `.SRCINFO` with
+   `makepkg --printsrcinfo > .SRCINFO`, and commit/push directly to `master` (AUR repos have
+   no PR mechanism — direct push is the only way to publish). Verify with a `makepkg -f`
+   build first.
 
 ## Live testing caveats
 
