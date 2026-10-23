@@ -4,6 +4,9 @@
 /// Commands that need Hyprland are expected to fail gracefully.
 #[cfg(test)]
 mod tests {
+    use std::io::{Read, Write};
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::UnixListener;
     use std::process::Command;
 
     fn cargo_bin() -> Command {
@@ -196,5 +199,308 @@ mod tests {
         assert!(!output.status.success());
         let stderr = String::from_utf8(output.stderr).unwrap();
         assert!(stderr.contains("error") || stderr.contains("unrecognized"));
+    }
+
+    #[test]
+    fn cli_pin_shows_star_and_clears() {
+        let dir = tempfile::tempdir().unwrap();
+        let session_dir = dir.path().join("sessions");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        std::fs::write(
+            session_dir.join("work.toml"),
+            "[session]\nname = \"work\"\ntimestamp = 1700000000\n",
+        )
+        .unwrap();
+
+        let config_path = dir.path().join("test.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[general]\nsession_dir = \"{}\"\n",
+                dir.path().to_string_lossy()
+            ),
+        )
+        .unwrap();
+        let cfg = config_path.to_str().unwrap();
+
+        let missing = cargo_bin()
+            .args(["--config", cfg, "pin", "missing"])
+            .output()
+            .unwrap();
+        assert!(!missing.status.success());
+
+        let pinned = cargo_bin()
+            .args(["--config", cfg, "pin", "work"])
+            .output()
+            .unwrap();
+        assert!(
+            pinned.status.success(),
+            "{}",
+            String::from_utf8_lossy(&pinned.stderr)
+        );
+
+        let listed = cargo_bin()
+            .args(["--config", cfg, "list"])
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8(listed.stdout).unwrap();
+        assert!(stdout.contains("* work"), "{stdout}");
+
+        let cleared = cargo_bin()
+            .args(["--config", cfg, "pin", "--clear"])
+            .output()
+            .unwrap();
+        assert!(cleared.status.success());
+        let listed = cargo_bin()
+            .args(["--config", cfg, "list"])
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8(listed.stdout).unwrap();
+        assert!(stdout.contains("work"));
+        assert!(!stdout.contains('*'), "{stdout}");
+    }
+
+    #[test]
+    fn cli_restore_dry_run_prints_plan_without_connecting() {
+        let dir = tempfile::tempdir().unwrap();
+        let session_dir = dir.path().join("sessions");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        let session_file = session_dir.join("work.toml");
+        std::fs::write(
+            &session_file,
+            "[session]\nname = \"work\"\ntimestamp = 1700000000\n\n[[window]]\napp_id = \"foot\"\nlaunch_cmd = \"foot\"\nworkspace = \"1\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&session_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&session_file, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let config_path = dir.path().join("test.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[general]\nsession_dir = \"{}\"\nnotify = false\n",
+                dir.path().to_string_lossy()
+            ),
+        )
+        .unwrap();
+
+        let output = cargo_bin()
+            .args([
+                "--config",
+                config_path.to_str().unwrap(),
+                "restore",
+                "--dry-run",
+                "work",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(
+            stdout.contains("exec [workspace 1 silent] foot"),
+            "{stdout}"
+        );
+        assert_eq!(
+            std::fs::metadata(&session_dir)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755
+        );
+        assert_eq!(
+            std::fs::metadata(&session_file)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o644
+        );
+    }
+
+    #[test]
+    fn cli_status_json_parses_when_hyprland_is_down() {
+        let dir = tempfile::tempdir().unwrap();
+        let session_dir = dir.path().join("sessions");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        std::fs::write(
+            session_dir.join("work.toml"),
+            "[session]\nname = \"work\"\ntimestamp = 1700000000\n\n[[window]]\napp_id = \"foot\"\nlaunch_cmd = \"foot\"\nworkspace = \"1\"\n",
+        )
+        .unwrap();
+
+        let config_path = dir.path().join("test.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[general]\nsession_dir = \"{}\"\nnotify = false\n",
+                dir.path().to_string_lossy()
+            ),
+        )
+        .unwrap();
+
+        let output = cargo_bin()
+            .args([
+                "--config",
+                config_path.to_str().unwrap(),
+                "status",
+                "--json",
+            ])
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(value["schemaVersion"], 1);
+        assert_eq!(value["hyprlandRunning"], false);
+        assert_eq!(value["windows"], 0);
+        assert_eq!(value["latest"]["name"], "work");
+        assert_eq!(value["latest"]["savedAt"], 1_700_000_000);
+        assert_eq!(value["latest"]["windows"], 1);
+        assert!(value["pin"].is_null());
+        assert!(value["disabled"].is_boolean());
+        assert_eq!(value["restoreOnStart"], true);
+        assert!(value["sessionDir"].as_str().unwrap().ends_with("sessions"));
+    }
+
+    #[test]
+    fn cli_verbose_delete_keeps_log_off_stdout() {
+        let dir = tempfile::tempdir().unwrap();
+        let session_dir = dir.path().join("sessions");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        let config_path = dir.path().join("test.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[general]\nsession_dir = \"{}\"\n",
+                session_dir.to_string_lossy()
+            ),
+        )
+        .unwrap();
+
+        let output = cargo_bin()
+            .env_remove("RUST_LOG")
+            .args([
+                "-v",
+                "--config",
+                config_path.to_str().unwrap(),
+                "delete",
+                "nonexistent",
+            ])
+            .output()
+            .unwrap();
+
+        assert!(output.status.success());
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert_eq!(stdout.trim(), "Deleted session 'nonexistent'.");
+        assert!(stderr.contains("not found"), "{stderr}");
+        assert!(!stdout.contains("not found"), "{stdout}");
+    }
+
+    #[test]
+    fn cli_status_reads_pinned_session_without_last() {
+        let dir = tempfile::tempdir().unwrap();
+        let session_dir = dir.path().join("sessions");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        std::fs::write(
+            session_dir.join("work.toml"),
+            "[session]\nname = \"work\"\ntimestamp = 1700000000\n\n[[window]]\napp_id = \"foot\"\nlaunch_cmd = \"foot\"\nworkspace = \"1\"\n",
+        )
+        .unwrap();
+        let config_path = dir.path().join("test.toml");
+        std::fs::write(
+            &config_path,
+            format!("[general]\nsession_dir = \"{}\"\n", dir.path().display()),
+        )
+        .unwrap();
+        let cfg = config_path.to_str().unwrap();
+        let pinned = cargo_bin()
+            .args(["--config", cfg, "pin", "work"])
+            .output()
+            .unwrap();
+        assert!(pinned.status.success());
+        assert!(!session_dir.join("last.toml").exists());
+
+        let runtime = dir.path().join("runtime");
+        let socket_dir = runtime.join("hypr/status-test");
+        std::fs::create_dir_all(&socket_dir).unwrap();
+        let listener = UnixListener::bind(socket_dir.join(".socket.sock")).unwrap();
+        let server = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = String::new();
+                stream.read_to_string(&mut request).unwrap();
+                assert_eq!(request, "j/clients");
+                stream.write_all(b"[]").unwrap();
+            }
+        });
+        let text = cargo_bin()
+            .env("XDG_RUNTIME_DIR", &runtime)
+            .env("HYPRLAND_INSTANCE_SIGNATURE", "status-test")
+            .args(["--config", cfg, "status"])
+            .output()
+            .unwrap();
+        assert!(text.status.success());
+        let stdout = String::from_utf8(text.stdout).unwrap();
+        assert!(stdout.contains("Saved session 'work': 1 apps"), "{stdout}");
+        assert!(!stdout.contains("No saved session."), "{stdout}");
+
+        let json = cargo_bin()
+            .env("XDG_RUNTIME_DIR", &runtime)
+            .env("HYPRLAND_INSTANCE_SIGNATURE", "status-test")
+            .args(["--config", cfg, "status", "--json"])
+            .output()
+            .unwrap();
+        assert!(json.status.success());
+        let value: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+        assert_eq!(value["pin"], "work");
+        assert_eq!(value["latest"]["name"], "work");
+        assert_eq!(value["latest"]["windows"], 1);
+        assert_eq!(value["latest"]["pinned"], true);
+        assert!(!session_dir.join("last.toml").exists());
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn cli_verbose_status_json_stays_one_json_object() {
+        let dir = tempfile::tempdir().unwrap();
+        let session_dir = dir.path().join("sessions");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        std::fs::write(
+            session_dir.join("work.toml"),
+            "[session]\nname = \"work\"\ntimestamp = 1700000000\n\n[[window]]\napp_id = \"foot\"\nlaunch_cmd = \"foot\"\nworkspace = \"1\"\n",
+        )
+        .unwrap();
+        let config_path = dir.path().join("test.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[general]\nsession_dir = \"{}\"\nnotify = false\n",
+                dir.path().to_string_lossy()
+            ),
+        )
+        .unwrap();
+
+        let output = cargo_bin()
+            .env_remove("RUST_LOG")
+            .args([
+                "-v",
+                "--config",
+                config_path.to_str().unwrap(),
+                "status",
+                "--json",
+            ])
+            .output()
+            .unwrap();
+
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let value: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+        assert_eq!(value["schemaVersion"], 1);
+        assert!(!stdout.contains("INFO"), "{stdout}");
+        assert!(!stdout.contains("WARN"), "{stdout}");
     }
 }

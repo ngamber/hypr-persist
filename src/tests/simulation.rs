@@ -120,8 +120,7 @@ mod tests {
 
         // Save session
         let session_dir = tempfile::tempdir().unwrap();
-        let snapshot =
-            SnapshotEngine::new_with_dir(session_dir.path().to_path_buf(), false).unwrap();
+        let snapshot = SnapshotEngine::new_with_dir(session_dir.path(), false).unwrap();
 
         let path = snapshot.save(&state, "test-lifecycle").unwrap();
         assert!(path.exists());
@@ -233,10 +232,10 @@ mod tests {
         assert_eq!(state.window_count(), 3);
 
         // Simulate: firefox moves to workspace 5
-        state.update_workspace("0xaaa", "5");
+        assert!(state.update_workspace("0xaaa", "5"));
 
         // Simulate: code becomes floating
-        state.update_floating("0xbbb", true);
+        assert!(state.update_floating("0xbbb", true));
 
         // Simulate: discord closes
         state.remove("0xccc");
@@ -244,8 +243,7 @@ mod tests {
 
         // Save and verify final state
         let session_dir = tempfile::tempdir().unwrap();
-        let snapshot =
-            SnapshotEngine::new_with_dir(session_dir.path().to_path_buf(), false).unwrap();
+        let snapshot = SnapshotEngine::new_with_dir(session_dir.path(), false).unwrap();
         snapshot.save(&state, "events").unwrap();
 
         let loaded = snapshot.load("events").unwrap();
@@ -288,8 +286,7 @@ mod tests {
 
         // Save with dedup (default mode)
         let session_dir = tempfile::tempdir().unwrap();
-        let snapshot =
-            SnapshotEngine::new_with_dir(session_dir.path().to_path_buf(), false).unwrap();
+        let snapshot = SnapshotEngine::new_with_dir(session_dir.path(), false).unwrap();
         snapshot.save(&state, "dedup").unwrap();
 
         let loaded = snapshot.load("dedup").unwrap();
@@ -297,8 +294,7 @@ mod tests {
         assert_eq!(loaded.windows[0].app_id, "firefox");
 
         // Save with per-window mode
-        let snapshot_pw =
-            SnapshotEngine::new_with_dir(session_dir.path().to_path_buf(), true).unwrap();
+        let snapshot_pw = SnapshotEngine::new_with_dir(session_dir.path(), true).unwrap();
         snapshot_pw.save(&state, "nodedup").unwrap();
 
         let loaded_pw = snapshot_pw.load("nodedup").unwrap();
@@ -326,8 +322,7 @@ mod tests {
         });
 
         let session_dir = tempfile::tempdir().unwrap();
-        let snapshot =
-            SnapshotEngine::new_with_dir(session_dir.path().to_path_buf(), false).unwrap();
+        let snapshot = SnapshotEngine::new_with_dir(session_dir.path(), false).unwrap();
 
         snapshot.save(&state, "work").unwrap();
 
@@ -348,7 +343,7 @@ mod tests {
 
         let sessions = snapshot.list().unwrap();
         assert_eq!(sessions.len(), 2);
-        let names: Vec<&str> = sessions.iter().map(|s| s.0.as_str()).collect();
+        let names: Vec<&str> = sessions.iter().map(|s| s.name.as_str()).collect();
         assert!(names.contains(&"work"));
         assert!(names.contains(&"gaming"));
 

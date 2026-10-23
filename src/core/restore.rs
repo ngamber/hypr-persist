@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 use tokio::io::AsyncBufReadExt;
@@ -7,6 +7,12 @@ use tokio::task::JoinHandle;
 
 use crate::core::layout::dwindle::{self, DwindlePlan};
 use crate::core::layout::master::{self, MasterPlan};
+use crate::core::quote::posix_single_quote;
+use crate::core::quote::{
+    WorkspaceName, exec_here, exec_on_workspace, focus_window, move_to_workspace_silent,
+    move_workspace_to_monitor, normalize_windowrule_name, shell_quote, shell_words,
+    workspace_switch,
+};
 use crate::core::state::normalize_address;
 use crate::ipc::client::HyprCtl;
 use crate::ipc::event_listener::parse_event;
@@ -41,6 +47,7 @@ const SINGLE_INSTANCE_FLAGS: &[&str] = &["--gtk-single-instance=true", "--single
 /// A window that was launched but didn't appear within the per-window timeout.
 /// Handed off to the background watcher for deferred placement.
 struct PendingWindow {
+    monitor: Option<String>,
     app_id: String,
     workspace: String,
     floating: bool,
@@ -227,15 +234,33 @@ impl RestoreEngine {
         self
     }
 
+    #[allow(clippy::too_many_lines)]
     pub async fn restore(
         &self,
         session: &SessionFile,
         ctl: &HyprCtl,
         live_windows: Vec<TrackedWindow>,
     ) -> Result<(RestoreReport, Option<JoinHandle<()>>)> {
-        let mut live_pool = LiveWindowPool::new(live_windows);
-        let mut report = RestoreReport::default();
         let total = session.windows.len();
+        let (windows, skipped) = partition_windows(session);
+        let mut report = RestoreReport::default();
+        for (app_id, err) in skipped {
+            tracing::warn!(
+                app_id = ?app_id,
+                reason = ?err.to_string(),
+                "skipping invalid saved window"
+            );
+            report.failed += 1;
+            report.errors.push((app_id.to_string(), err.to_string()));
+        }
+        if windows.is_empty() {
+            validate_session(session)?;
+        }
+        let session = &SessionFile {
+            session: session.session.clone(),
+            windows: windows.into_iter().cloned().collect(),
+        };
+        let mut live_pool = LiveWindowPool::new(live_windows);
         tracing::info!(
             "restoring session '{}' ({total} apps)",
             session.session.name
@@ -301,6 +326,8 @@ impl RestoreEngine {
             drop(ctl.keyword("misc:focus_on_activate true").await);
         }
         listener.abort();
+
+        bind_workspaces_to_monitors(session, ctl).await;
 
         tracing::info!(
             "restore complete: {}/{total} apps ({} failed, {} pending)",
@@ -553,7 +580,7 @@ impl RestoreEngine {
                     .await,
             );
 
-            ctl.dispatch(&format!("workspace {ws}")).await?;
+            ctl.dispatch(&workspace_switch(ws)?).await?;
             drop(
                 ctl.dispatch(&format!("layoutmsg orientation{}", plan.orientation))
                     .await,
@@ -814,7 +841,7 @@ impl RestoreEngine {
                         Some((focus_addr.as_str(), presel))
                     } else {
                         if i == 0 {
-                            ctl.dispatch(&format!("workspace {ws}")).await?;
+                            ctl.dispatch(&workspace_switch(ws)?).await?;
                         }
                         None
                     };
@@ -892,12 +919,12 @@ impl RestoreEngine {
         }
 
         let rule_name = format!(
-            "hypr-persist-{}-{}",
-            window.app_id.replace(['.', ' '], "-"),
-            rule_counter
+            "hypr-persist-{}-{rule_counter}",
+            normalize_windowrule_name(&window.app_id)?,
         );
         *rule_counter += 1;
         let class_escaped = regex::escape(&window.app_id);
+        let workspace = WorkspaceName::parse(&window.workspace)?;
 
         ctl.keyword(&format!(
             "windowrule[{rule_name}]:match:class ^({class_escaped})$"
@@ -905,11 +932,11 @@ impl RestoreEngine {
         .await?;
         ctl.keyword(&format!(
             "windowrule[{rule_name}]:workspace {} silent",
-            window.workspace
+            workspace.as_str()
         ))
         .await?;
-        let launch_cmd = build_bsp_launch_cmd(window);
-        ctl.dispatch(&format!("exec {launch_cmd}"))
+        let launch_cmd = build_bsp_launch_cmd(window)?;
+        ctl.dispatch(&exec_here(&launch_cmd))
             .await
             .with_context(|| format!("launching {}", window.launch_cmd))?;
 
@@ -917,11 +944,8 @@ impl RestoreEngine {
             tracing::debug!("  {} appeared at 0x{addr}", window.app_id);
             disable_all_rules(ctl, &[rule_name]).await;
             drop(
-                ctl.dispatch(&format!(
-                    "movetoworkspacesilent {},address:0x{addr}",
-                    window.workspace
-                ))
-                .await,
+                ctl.dispatch(&move_to_workspace_silent(&window.workspace, addr)?)
+                    .await,
             );
             let final_addr = self
                 .retile_superseding_window(
@@ -954,6 +978,7 @@ impl RestoreEngine {
             );
             active_rules.push(rule_name.clone());
             pending.push(PendingWindow {
+                monitor: window.monitor.clone(),
                 app_id: window.app_id.clone(),
                 workspace: window.workspace.clone(),
                 floating: window.floating,
@@ -1074,7 +1099,10 @@ impl RestoreEngine {
                 let Some(addr) = addresses.get(&step.focus_window_idx) else {
                     continue;
                 };
-                if let Err(e) = ctl.dispatch(&format!("focuswindow address:0x{addr}")).await {
+                let Ok(cmd) = focus_window(addr) else {
+                    continue;
+                };
+                if let Err(e) = ctl.dispatch(&cmd).await {
                     tracing::warn!("splitratio: focus failed: {e}");
                     continue;
                 }
@@ -1469,21 +1497,19 @@ impl RestoreEngine {
                 window.app_id
             );
             drop(
-                ctl.dispatch(&format!(
-                    "movetoworkspacesilent {},address:0x{addr}",
-                    window.workspace
-                ))
-                .await,
+                ctl.dispatch(&move_to_workspace_silent(&window.workspace, &addr)?)
+                    .await,
             );
             return Ok(LaunchOutcome::Adopted(addr));
         }
 
         let rule_name = format!(
             "hypr-persist-{}-{}",
-            window.app_id.replace(['.', ' '], "-"),
+            normalize_windowrule_name(&window.app_id)?,
             active_rules.len()
         );
         let class_escaped = regex::escape(&window.app_id);
+        let workspace = WorkspaceName::parse(&window.workspace)?;
 
         ctl.keyword(&format!(
             "windowrule[{rule_name}]:match:class ^({class_escaped})$"
@@ -1491,17 +1517,14 @@ impl RestoreEngine {
         .await?;
         ctl.keyword(&format!(
             "windowrule[{rule_name}]:workspace {} silent",
-            window.workspace
+            workspace.as_str()
         ))
         .await?;
 
-        let launch_cmd = build_launch_cmd(window);
-        ctl.dispatch(&format!(
-            "exec [workspace {} silent] {launch_cmd}",
-            window.workspace
-        ))
-        .await
-        .with_context(|| format!("launching {}", window.launch_cmd))?;
+        let launch_cmd = build_launch_cmd(window)?;
+        ctl.dispatch(&exec_on_workspace(&window.workspace, &launch_cmd)?)
+            .await
+            .with_context(|| format!("launching {}", window.launch_cmd))?;
 
         if let Some(ref addr) = self.wait_for_open_event(events, &window.app_id).await {
             tracing::debug!("  {} appeared at 0x{addr}", window.app_id);
@@ -1515,11 +1538,8 @@ impl RestoreEngine {
             };
 
             drop(
-                ctl.dispatch(&format!(
-                    "movetoworkspacesilent {},address:0x{final_addr}",
-                    window.workspace
-                ))
-                .await,
+                ctl.dispatch(&move_to_workspace_silent(&window.workspace, &final_addr)?)
+                    .await,
             );
             if master_role == MasterRole::Promote {
                 drop(ctl.dispatch("layoutmsg addmaster").await);
@@ -1536,11 +1556,8 @@ impl RestoreEngine {
             );
             disable_all_rules(ctl, &[rule_name]).await;
             drop(
-                ctl.dispatch(&format!(
-                    "movetoworkspacesilent {},address:0x{addr}",
-                    window.workspace
-                ))
-                .await,
+                ctl.dispatch(&move_to_workspace_silent(&window.workspace, &addr)?)
+                    .await,
             );
             Ok(LaunchOutcome::Adopted(addr))
         } else {
@@ -1551,6 +1568,7 @@ impl RestoreEngine {
             );
             active_rules.push(rule_name.clone());
             pending.push(PendingWindow {
+                monitor: window.monitor.clone(),
                 app_id: window.app_id.clone(),
                 workspace: window.workspace.clone(),
                 floating: window.floating,
@@ -1768,20 +1786,14 @@ async fn place_window_in_bsp_slot(
     workspace: &str,
     anchor: Option<(&str, dwindle::PreselDir)>,
 ) {
-    if ctl
-        .dispatch(&format!(
-            "movetoworkspacesilent {workspace},address:0x{addr}"
-        ))
-        .await
-        .is_ok()
+    if let Ok(cmd) = move_to_workspace_silent(workspace, addr)
+        && ctl.dispatch(&cmd).await.is_ok()
     {
         tracing::debug!("place: move to workspace ok");
     }
 
-    if ctl
-        .dispatch(&format!("focuswindow address:0x{addr}"))
-        .await
-        .is_ok()
+    if let Ok(cmd) = focus_window(addr)
+        && ctl.dispatch(&cmd).await.is_ok()
     {
         tracing::debug!("place: focus ok");
     }
@@ -1794,10 +1806,8 @@ async fn place_window_in_bsp_slot(
     }
 
     if let Some((anchor_addr, presel)) = anchor {
-        if ctl
-            .dispatch(&format!("focuswindow address:0x{anchor_addr}"))
-            .await
-            .is_ok()
+        if let Ok(cmd) = focus_window(anchor_addr)
+            && ctl.dispatch(&cmd).await.is_ok()
         {
             tracing::debug!("place: focus anchor ok");
         }
@@ -1836,24 +1846,26 @@ async fn apply_late_window(
             .await;
         }
         (PlacementHint::MasterPromote, false) => {
-            drop(
-                ctl.dispatch(&format!(
-                    "movetoworkspacesilent {},address:0x{address}",
-                    pw.workspace
-                ))
-                .await,
-            );
+            if let Ok(cmd) = move_to_workspace_silent(&pw.workspace, address) {
+                drop(ctl.dispatch(&cmd).await);
+            }
             drop(ctl.dispatch("layoutmsg addmaster").await);
         }
         _ => {
-            drop(
-                ctl.dispatch(&format!(
-                    "movetoworkspacesilent {},address:0x{address}",
-                    pw.workspace
-                ))
-                .await,
-            );
+            if let Ok(cmd) = move_to_workspace_silent(&pw.workspace, address) {
+                drop(ctl.dispatch(&cmd).await);
+            }
         }
+    }
+
+    if let Some(monitor) = &pw.monitor
+        && ctl
+            .get_monitors()
+            .await
+            .is_ok_and(|monitors| monitors.iter().any(|m| &m.name == monitor))
+        && let Ok(cmd) = move_workspace_to_monitor(&pw.workspace, monitor)
+    {
+        drop(ctl.dispatch(&cmd).await);
     }
 
     if restore_geometry
@@ -1886,69 +1898,124 @@ async fn apply_late_window(
     }
 }
 
-/// Build the exec command, injecting browser profile flags and/or saved CWD.
-///
-/// Profile flags (e.g. `-P work`, `--profile-directory=Profile 1`) are
-/// appended to the base launch command before CWD handling, since browsers
-/// and terminals are mutually exclusive in practice.
-///
-/// For known terminals: strips single-instance flags (so each launch is
-/// its own process) and appends `--working-directory=<path>`.
-/// For other apps with CWD: wraps with `cd <path> && exec <cmd>`.
-fn build_launch_cmd(window: &WindowEntry) -> String {
-    let cmd = window.profile.as_ref().map_or_else(
-        || window.launch_cmd.clone(),
-        |profile| format!("{} {profile}", window.launch_cmd),
-    );
-
-    let Some(cwd) = window.cwd.as_deref() else {
-        return cmd;
-    };
-
-    terminal_cwd_flag(&cmd).map_or_else(
-        || {
-            let escaped = shell_escape(cwd);
-            format!("sh -c 'cd {escaped} && exec {cmd}'")
-        },
-        |flag| {
-            let clean = strip_single_instance_flags(&cmd);
-            format!("{clean} {flag}{cwd}")
-        },
-    )
+pub fn validate_session(session: &SessionFile) -> Result<()> {
+    session.windows.iter().try_for_each(validate_window)
 }
 
-fn strip_single_instance_flags(cmd: &str) -> String {
-    cmd.split_whitespace()
-        .filter(|arg| !SINGLE_INSTANCE_FLAGS.contains(arg))
+pub fn partition_windows(session: &SessionFile) -> (Vec<&WindowEntry>, Vec<(&str, anyhow::Error)>) {
+    let mut valid = Vec::new();
+    let mut skipped = Vec::new();
+    for window in &session.windows {
+        match validate_window(window) {
+            Ok(()) => valid.push(window),
+            Err(err) => skipped.push((window.app_id.as_str(), err)),
+        }
+    }
+    (valid, skipped)
+}
+
+fn validate_window(window: &WindowEntry) -> Result<()> {
+    crate::core::quote::reject_control_bytes(&window.app_id)?;
+    crate::core::quote::reject_control_bytes(&window.launch_cmd)?;
+    if let Some(cwd) = window.cwd.as_deref() {
+        crate::core::quote::reject_control_bytes(cwd)?;
+    }
+    if let Some(profile) = window.profile.as_deref() {
+        crate::core::quote::reject_control_bytes(profile)?;
+        shell_words(profile)?;
+    }
+    let launch_argv = shell_words(&window.launch_cmd)?;
+    if window.launch_cmd.trim().is_empty() {
+        bail!("empty launch command for '{}'", window.app_id);
+    }
+    if launch_argv.first().is_some_and(String::is_empty) {
+        bail!("empty program in launch command for '{}'", window.app_id);
+    }
+    WorkspaceName::parse(&window.workspace)?;
+    if let Some(monitor) = window.monitor.as_deref().filter(|name| !name.is_empty()) {
+        crate::core::quote::MonitorName::parse(monitor)?;
+    }
+    Ok(())
+}
+
+/// Launch and monitor-bind lines for a session, using the same constructors as restore.
+pub fn plan_restore(session: &SessionFile) -> Result<Vec<String>> {
+    let (windows, skipped) = partition_windows(session);
+    let mut lines: Vec<_> = skipped
+        .into_iter()
+        .map(|(app_id, err)| format!("# skipped: {app_id:?}: {err:?}"))
+        .collect();
+    let mut bound = HashSet::new();
+    for window in &windows {
+        if let Some(monitor) = window.monitor.as_deref().filter(|name| !name.is_empty()) {
+            let key = (window.workspace.clone(), monitor.to_string());
+            if bound.insert(key) {
+                lines.push(move_workspace_to_monitor(&window.workspace, monitor)?);
+            }
+        }
+    }
+    for window in windows {
+        let launch = build_launch_cmd(window)?;
+        lines.push(exec_on_workspace(&window.workspace, &launch)?);
+    }
+    Ok(lines)
+}
+
+/// Build the exec command from saved argv.
+///
+/// `launch_cmd` and `profile` are split with POSIX quoting. `profile` may be
+/// several argv elements. Each element is quoted once.
+///
+/// For known terminals with a saved cwd: strips single-instance flags and
+/// appends `--working-directory=<path>`. For other apps with a cwd: one
+/// `sh -c` argument whose script is `cd <path> && exec <argv>`.
+fn build_launch_cmd(window: &WindowEntry) -> Result<String> {
+    join_launch(window, false)
+}
+
+/// BSP restore always strips single-instance flags so each launch is its own
+/// process. A single-instance app would open on the existing process's
+/// workspace and skip the preselect on the target workspace.
+fn build_bsp_launch_cmd(window: &WindowEntry) -> Result<String> {
+    join_launch(window, true)
+}
+
+fn join_launch(window: &WindowEntry, strip_single_instance: bool) -> Result<String> {
+    let mut argv = shell_words(&window.launch_cmd)?;
+    if let Some(profile) = window.profile.as_deref() {
+        argv.extend(shell_words(profile)?);
+    }
+    let terminal = argv.first().and_then(|bin| terminal_flag(bin));
+    if strip_single_instance || (terminal.is_some() && window.cwd.is_some()) {
+        argv.retain(|arg| !SINGLE_INSTANCE_FLAGS.contains(&arg.as_str()));
+    }
+    let cmd = quote_join(&argv);
+    let Some(cwd) = window.cwd.as_deref() else {
+        return Ok(cmd);
+    };
+    if let Some(flag) = terminal {
+        return Ok(format!("{cmd} {flag}{}", shell_quote(cwd)));
+    }
+    let script = format!("cd {} && exec {cmd}", shell_quote(cwd));
+    Ok(format!("sh -c {}", posix_single_quote(&script)))
+}
+
+fn quote_join(argv: &[String]) -> String {
+    argv.iter()
+        .map(|arg| shell_quote(arg))
         .collect::<Vec<_>>()
         .join(" ")
 }
 
-/// Build launch command for BSP restore: always strips single-instance flags
-/// so each launch creates an independent process (critical for preselect to
-/// work, since single-instance apps create windows in the existing process's
-/// workspace, bypassing the preselection on the target workspace).
-fn build_bsp_launch_cmd(window: &WindowEntry) -> String {
-    let base = build_launch_cmd(window);
-    strip_single_instance_flags(&base)
-}
-
-/// Match the binary name in a launch command against known terminals
-/// and return the appropriate `--working-directory=` style flag.
-fn terminal_cwd_flag(launch_cmd: &str) -> Option<&'static str> {
-    let bin = launch_cmd.split_whitespace().next()?.rsplit('/').next()?;
+fn terminal_flag(argv0: &str) -> Option<&'static str> {
+    let bin = argv0.rsplit_once('/').map_or(argv0, |(_, base)| base);
     TERMINAL_CWD_FLAGS
         .iter()
         .find(|(name, _)| *name == bin)
         .map(|(_, flag)| *flag)
 }
 
-fn shell_escape(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "'\\''"))
-}
-
-/// Before restoring windows, move each workspace to the monitor it was
-/// originally saved on. Only binds to monitors that are currently connected;
+/// Move populated workspaces to their saved monitors when connected.
 /// workspaces targeting unavailable monitors get default Hyprland placement
 /// (typically the first available monitor).
 async fn bind_workspaces_to_monitors(session: &SessionFile, ctl: &HyprCtl) {
@@ -1979,13 +2046,9 @@ async fn bind_workspaces_to_monitors(session: &SessionFile, ctl: &HyprCtl) {
             "binding workspace {} to monitor {monitor}",
             window.workspace
         );
-        drop(
-            ctl.dispatch(&format!(
-                "moveworkspacetomonitor {} {monitor}",
-                window.workspace
-            ))
-            .await,
-        );
+        if let Ok(cmd) = move_workspace_to_monitor(&window.workspace, monitor) {
+            drop(ctl.dispatch(&cmd).await);
+        }
         bound += 1;
     }
 
@@ -2025,6 +2088,8 @@ pub struct RestoreReport {
 mod tests {
     use super::*;
     use crate::ipc::client::HyprSocketPaths;
+    use crate::models::SessionMeta;
+    use std::process::Command;
     use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::UnixListener;
@@ -2079,6 +2144,8 @@ mod tests {
                     log.lock().await.push(buf.clone());
                     let response = if buf.contains("j/clients") {
                         clients_json.lock().await.clone()
+                    } else if buf == "j/monitors" {
+                        r#"[{"id":0,"name":"DP-1"}]"#.to_string()
                     } else {
                         "ok".to_string()
                     };
@@ -2176,19 +2243,99 @@ mod tests {
     #[test]
     fn build_cmd_no_profile_no_cwd() {
         let entry = make_entry("firefox", "firefox", None, None);
-        assert_eq!(build_launch_cmd(&entry), "firefox");
+        assert_eq!(build_launch_cmd(&entry).unwrap(), "firefox");
+    }
+
+    fn shell_argv(cmd: &str) -> Vec<String> {
+        let script = format!("set -- {cmd}\nfor arg in \"$@\"; do printf '%s\\n' \"$arg\"; done");
+        let output = Command::new("sh").arg("-c").arg(&script).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{cmd}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn session_of(window: WindowEntry) -> SessionFile {
+        SessionFile {
+            session: SessionMeta {
+                name: "t".to_string(),
+                timestamp: 0,
+            },
+            windows: vec![window],
+        }
+    }
+
+    #[test]
+    fn plan_restore_skips_bad_launch_and_legacy_profile_before_valid_plan() {
+        let mut session = session_of(make_entry("good", "good", None, None));
+        session.windows.extend([
+            make_entry("bad\n\u{1b}[31m", "app'", None, None),
+            make_entry("bad-profile", "firefox", Some("-P Bob's"), None),
+        ]);
+        let lines = plan_restore(&session).unwrap();
+        assert!(
+            lines[0].starts_with("# skipped: \"bad\\n\\u{1b}[31m\":"),
+            "{lines:?}"
+        );
+        assert!(
+            lines[1].starts_with("# skipped: \"bad-profile\":"),
+            "{lines:?}"
+        );
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[2], "exec [workspace 1 silent] good");
+    }
+
+    #[test]
+    fn partition_keeps_valid_windows_and_reports_invalid_rows() {
+        let mut session = session_of(make_entry("good", "good", None, None));
+        session.windows.extend([
+            make_entry("bad-launch", "app'", None, None),
+            make_entry("bad-profile", "firefox", Some("-P Bob's"), None),
+        ]);
+        let (valid, skipped) = partition_windows(&session);
+        assert_eq!(valid.len(), 1);
+        assert_eq!(valid[0].app_id, "good");
+        assert_eq!(skipped.len(), 2);
+        assert_eq!(skipped[0].0, "bad-launch");
+        assert_eq!(skipped[1].0, "bad-profile");
+        assert!(skipped[0].1.to_string().contains("unclosed quote"));
+        assert!(skipped[1].1.to_string().contains("unclosed quote"));
+        assert!(validate_session(&session).is_err());
+    }
+
+    #[tokio::test]
+    async fn restore_rejects_session_without_valid_windows_before_ipc() {
+        let session = session_of(make_entry("bad", "app'", None, None));
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("missing.sock");
+        let ctl = HyprCtl::new(HyprSocketPaths::new(socket.clone(), socket));
+        let result = RestoreEngine::new(false, false)
+            .restore(&session, &ctl, Vec::new())
+            .await;
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("unclosed quote"), "{err}");
     }
 
     #[test]
     fn build_cmd_with_profile() {
         let entry = make_entry("firefox", "firefox", Some("-P work"), None);
-        assert_eq!(build_launch_cmd(&entry), "firefox -P work");
+        let cmd = build_launch_cmd(&entry).unwrap();
+        assert_eq!(cmd, "firefox -P work");
+        assert_eq!(shell_argv(&cmd), ["firefox", "-P", "work"]);
     }
 
     #[test]
     fn build_cmd_with_no_remote_profile() {
         let entry = make_entry("firefox", "firefox", Some("-no-remote -P dev"), None);
-        assert_eq!(build_launch_cmd(&entry), "firefox -no-remote -P dev");
+        let cmd = build_launch_cmd(&entry).unwrap();
+        assert_eq!(cmd, "firefox -no-remote -P dev");
+        assert_eq!(shell_argv(&cmd), ["firefox", "-no-remote", "-P", "dev"]);
     }
 
     #[test]
@@ -2196,12 +2343,14 @@ mod tests {
         let entry = make_entry(
             "chromium",
             "chromium",
-            Some("--profile-directory=Profile 1"),
+            Some("'--profile-directory=Profile 1'"),
             None,
         );
+        let cmd = build_launch_cmd(&entry).unwrap();
+        assert_eq!(cmd, "chromium '--profile-directory=Profile 1'");
         assert_eq!(
-            build_launch_cmd(&entry),
-            "chromium --profile-directory=Profile 1"
+            shell_argv(&cmd),
+            ["chromium", "--profile-directory=Profile 1"]
         );
     }
 
@@ -2213,17 +2362,144 @@ mod tests {
             Some("-P work"),
             None,
         );
+        let cmd = build_launch_cmd(&entry).unwrap();
+        assert_eq!(cmd, "flatpak run org.mozilla.firefox -P work");
         assert_eq!(
-            build_launch_cmd(&entry),
-            "flatpak run org.mozilla.firefox -P work"
+            shell_argv(&cmd),
+            ["flatpak", "run", "org.mozilla.firefox", "-P", "work"]
         );
+    }
+
+    #[test]
+    fn build_cmd_quoted_executable_stays_one_argument() {
+        let entry = make_entry("app", r#""/opt/My App/bin/app" --flag"#, None, None);
+        let cmd = build_launch_cmd(&entry).unwrap();
+        assert_eq!(cmd, "'/opt/My App/bin/app' --flag");
+        assert_eq!(shell_argv(&cmd), ["/opt/My App/bin/app", "--flag"]);
+        assert_eq!(
+            exec_on_workspace("1", &cmd).unwrap(),
+            "exec [workspace 1 silent] '/opt/My App/bin/app' --flag"
+        );
+    }
+
+    #[test]
+    fn cwd_wrapper_is_one_sh_argument_and_changes_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("My Project's");
+        std::fs::create_dir(&project).unwrap();
+        let entry = make_entry("pwd", "pwd", None, Some(project.to_str().unwrap()));
+        let cmd = build_launch_cmd(&entry).unwrap();
+        let args = shell_argv(&cmd);
+        assert_eq!(args.len(), 3, "{cmd} -> {args:?}");
+        assert_eq!(args[0], "sh");
+        assert_eq!(args[1], "-c");
+        let output = Command::new("sh").arg("-c").arg(&args[2]).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{cmd}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap().trim(),
+            project.to_str().unwrap()
+        );
+    }
+
+    #[test]
+    fn cwd_wrapper_does_not_run_command_substitution() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("pwned");
+        let cwd = format!("$(touch {})", marker.display());
+        let entry = make_entry("true", "true", None, Some(&cwd));
+        let cmd = build_launch_cmd(&entry).unwrap();
+        let args = shell_argv(&cmd);
+        assert_eq!(args.len(), 3, "{cmd} -> {args:?}");
+        drop(Command::new("sh").arg("-c").arg(&args[2]).status());
+        assert!(!marker.exists(), "command substitution ran: {cmd}");
+    }
+
+    #[test]
+    fn validate_session_rejects_control_bytes_in_launch_cwd_and_profile() {
+        let launch = make_entry("foot", "foot\n", None, None);
+        assert!(validate_session(&session_of(launch)).is_err());
+
+        let cwd = make_entry("foot", "foot", None, Some("/tmp/\u{1}"));
+        assert!(validate_session(&session_of(cwd)).is_err());
+
+        let profile = make_entry("foot", "foot", Some("ok\t"), None);
+        assert!(validate_session(&session_of(profile)).is_err());
+
+        let ok = make_entry("foot", "foot", Some("-P work"), None);
+        assert!(validate_session(&session_of(ok)).is_ok());
+    }
+
+    #[test]
+    fn validate_window_rejects_unclosed_quote_in_profile() {
+        let window = make_entry("firefox", "firefox", Some("'-P"), None);
+        let err = validate_window(&window).unwrap_err();
+        assert!(err.to_string().contains("unclosed quote"), "{err}");
+    }
+
+    #[test]
+    fn validate_window_rejects_whitespace_only_launch_command() {
+        let window = make_entry("empty", "   ", None, None);
+        let err = validate_window(&window).unwrap_err();
+        assert!(err.to_string().contains("empty launch command"), "{err}");
+    }
+
+    #[test]
+    fn empty_middle_argument_survives_round_trip() {
+        let entry = make_entry("app", "app --title '' --flag", None, None);
+        validate_window(&entry).unwrap();
+        let cmd = build_launch_cmd(&entry).unwrap();
+        assert_eq!(shell_argv(&cmd), ["app", "--title", "", "--flag"]);
+        assert_eq!(shell_words(&cmd).unwrap(), ["app", "--title", "", "--flag"]);
+    }
+
+    #[test]
+    fn empty_argument_survives_cwd_and_terminal_flag() {
+        let terminal = make_entry("ghostty", "ghostty --title ''", None, Some("/tmp/work"));
+        let cmd = build_launch_cmd(&terminal).unwrap();
+        assert_eq!(
+            shell_argv(&cmd),
+            ["ghostty", "--title", "", "--working-directory=/tmp/work"]
+        );
+
+        let wrapped = make_entry("app", "app --title '' --flag", None, Some("/tmp/work"));
+        let cmd = build_launch_cmd(&wrapped).unwrap();
+        let args = shell_argv(&cmd);
+        assert_eq!(args[0], "sh");
+        assert_eq!(args[1], "-c");
+        let exec_tail = args[2].split_once(" && exec ").unwrap().1;
+        assert_eq!(shell_argv(exec_tail), ["app", "--title", "", "--flag"]);
+    }
+
+    #[test]
+    fn validate_window_rejects_empty_program() {
+        let window = make_entry("app", "'' --flag", None, None);
+        let err = validate_window(&window).unwrap_err();
+        assert!(err.to_string().contains("empty program"), "{err}");
+    }
+
+    #[test]
+    fn proc_apostrophe_and_backslash_paths_round_trip() {
+        let cases = ["/opt/O'Brien/bin/app", r"/opt/foo\bar\app"];
+        for program in cases {
+            let argv = vec![program.to_string()];
+            let launch = crate::resolver::proc::resolve_from_args(&argv, &|_| false).unwrap();
+            let entry = make_entry("app", &launch, None, None);
+            validate_window(&entry).unwrap();
+            let cmd = build_launch_cmd(&entry).unwrap();
+            assert_eq!(shell_argv(&cmd), argv.as_slice());
+            assert_eq!(shell_words(&cmd).unwrap(), argv);
+        }
     }
 
     #[test]
     fn build_cmd_with_cwd_no_profile() {
         let entry = make_entry("ghostty", "ghostty", None, Some("/home/user/project"));
         assert_eq!(
-            build_launch_cmd(&entry),
+            build_launch_cmd(&entry).unwrap(),
             "ghostty --working-directory=/home/user/project"
         );
     }
@@ -2231,7 +2507,7 @@ mod tests {
     #[test]
     fn build_cmd_profile_does_not_affect_cwd() {
         let entry = make_entry("ghostty", "ghostty", None, Some("/tmp"));
-        let cmd = build_launch_cmd(&entry);
+        let cmd = build_launch_cmd(&entry).unwrap();
         assert!(cmd.contains("--working-directory=/tmp"));
     }
 
@@ -2254,6 +2530,7 @@ mod tests {
 
         let paths = HyprSocketPaths::new(sock1, sock2);
         let pending = vec![PendingWindow {
+            monitor: Some("DP-1".to_string()),
             app_id: "slow-app".to_string(),
             workspace: "3".to_string(),
             floating: false,
@@ -2274,6 +2551,13 @@ mod tests {
         assert!(
             has_move,
             "expected movetoworkspacesilent dispatch, got: {commands:?}"
+        );
+
+        assert!(
+            commands
+                .iter()
+                .any(|c| c.contains("moveworkspacetomonitor 3 DP-1")),
+            "late workspace missed its saved monitor: {commands:?}"
         );
 
         let has_rule_disable = commands
@@ -2310,6 +2594,7 @@ mod tests {
 
         let paths = HyprSocketPaths::new(sock1, sock2);
         let pending = vec![PendingWindow {
+            monitor: None,
             app_id: "slack".to_string(),
             workspace: "4".to_string(),
             floating: false,
@@ -2382,6 +2667,7 @@ mod tests {
 
         let paths = HyprSocketPaths::new(sock1, sock2);
         let pending = vec![PendingWindow {
+            monitor: None,
             app_id: "thunar".to_string(),
             workspace: "4".to_string(),
             floating: false,
@@ -2434,6 +2720,7 @@ mod tests {
 
         let paths = HyprSocketPaths::new(sock1, sock2);
         let pending = vec![PendingWindow {
+            monitor: None,
             app_id: "kitty".to_string(),
             workspace: "4".to_string(),
             floating: false,
@@ -2485,6 +2772,7 @@ mod tests {
 
         let paths = HyprSocketPaths::new(sock1, sock2);
         let pending = vec![PendingWindow {
+            monitor: None,
             app_id: "missing-app".to_string(),
             workspace: "2".to_string(),
             floating: false,
@@ -2546,6 +2834,7 @@ mod tests {
 
         let paths = HyprSocketPaths::new(sock1, sock2);
         let pending = vec![PendingWindow {
+            monitor: None,
             app_id: "floater".to_string(),
             workspace: "5".to_string(),
             floating: true,
@@ -2613,6 +2902,7 @@ mod tests {
         let paths = HyprSocketPaths::new(sock1, sock2);
         let pending = vec![
             PendingWindow {
+                monitor: None,
                 app_id: "app-a".to_string(),
                 workspace: "1".to_string(),
                 floating: false,
@@ -2623,6 +2913,7 @@ mod tests {
                 placement: PlacementHint::None,
             },
             PendingWindow {
+                monitor: None,
                 app_id: "app-b".to_string(),
                 workspace: "4".to_string(),
                 floating: false,

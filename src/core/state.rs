@@ -7,6 +7,7 @@ use crate::models::{HyprClient, TrackedWindow};
 
 pub struct StateManager {
     windows: HashMap<String, TrackedWindow>,
+    pending_opens: HashMap<String, String>,
     exclude_patterns: Vec<Regex>,
     include_patterns: Vec<Regex>,
 }
@@ -45,6 +46,7 @@ impl StateManager {
 
         Self {
             windows: HashMap::new(),
+            pending_opens: HashMap::new(),
             exclude_patterns,
             include_patterns,
         }
@@ -76,11 +78,27 @@ impl StateManager {
             window.workspace
         );
         let key = normalize_address(&window.address);
+        self.pending_opens.remove(&key);
         self.windows.insert(key, window);
+    }
+
+    pub fn defer_open(&mut self, address: &str, class: String) {
+        self.pending_opens.insert(normalize_address(address), class);
+    }
+
+    pub fn pending_class(&self, address: &str) -> Option<&str> {
+        self.pending_opens
+            .get(&normalize_address(address))
+            .map(String::as_str)
+    }
+
+    pub fn has_pending_opens(&self) -> bool {
+        !self.pending_opens.is_empty()
     }
 
     pub fn remove(&mut self, address: &str) -> Option<TrackedWindow> {
         let key = normalize_address(address);
+        self.pending_opens.remove(&key);
         let w = self.windows.remove(&key);
         if let Some(ref w) = w {
             tracing::debug!("untracked: {} ({})", w.app_id, address);
@@ -88,19 +106,33 @@ impl StateManager {
         w
     }
 
-    pub fn update_workspace(&mut self, address: &str, workspace: &str) {
+    /// Returns whether a tracked window's workspace actually changed.
+    #[must_use]
+    pub fn update_workspace(&mut self, address: &str, workspace: &str) -> bool {
         let key = normalize_address(address);
-        if let Some(w) = self.windows.get_mut(&key) {
-            w.workspace = workspace.to_string();
-            tracing::debug!("updated workspace: {} → {workspace}", w.app_id);
+        let Some(window) = self.windows.get_mut(&key) else {
+            return false;
+        };
+        if window.workspace == workspace {
+            return false;
         }
+        window.workspace = workspace.to_string();
+        tracing::debug!("updated workspace: {} → {workspace}", window.app_id);
+        true
     }
 
-    pub fn update_floating(&mut self, address: &str, floating: bool) {
+    /// Returns whether a tracked window's floating bit actually changed.
+    #[must_use]
+    pub fn update_floating(&mut self, address: &str, floating: bool) -> bool {
         let key = normalize_address(address);
-        if let Some(w) = self.windows.get_mut(&key) {
-            w.floating = floating;
+        let Some(window) = self.windows.get_mut(&key) else {
+            return false;
+        };
+        if window.floating == floating {
+            return false;
         }
+        window.floating = floating;
+        true
     }
 
     /// Update position, size, floating, fullscreen and monitor for all tracked
@@ -175,6 +207,9 @@ mod tests {
                 per_window_launch: false,
                 restore_geometry: false,
                 restore_layout: true,
+                settle_delay: 10,
+                max_preexisting_windows: 3,
+                notify: true,
             },
             rules: RulesConfig {
                 exclude: exclude.into_iter().map(String::from).collect(),
@@ -331,7 +366,8 @@ mod tests {
         let mut state = StateManager::new(&test_config(vec![], vec![]));
         state.add(make_window("0xabc", "firefox", "1"));
 
-        state.update_workspace("0xabc", "5");
+        assert!(state.update_workspace("0xabc", "5"));
+        assert!(!state.update_workspace("0xabc", "5"));
 
         let windows = state.windows();
         assert_eq!(windows[0].workspace, "5");
@@ -341,7 +377,7 @@ mod tests {
     fn update_workspace_nonexistent_is_noop() {
         let mut state = StateManager::new(&test_config(vec![], vec![]));
         state.add(make_window("0xabc", "firefox", "1"));
-        state.update_workspace("0xnonexistent", "5");
+        assert!(!state.update_workspace("0xnonexistent", "5"));
 
         let windows = state.windows();
         assert_eq!(windows[0].workspace, "1");
@@ -355,11 +391,13 @@ mod tests {
         state.add(make_window("0xabc", "firefox", "1"));
 
         assert!(!state.windows()[0].floating);
+        assert!(!state.update_floating("0xabc", false));
+        assert!(!state.update_floating("0xmissing", true));
 
-        state.update_floating("0xabc", true);
+        assert!(state.update_floating("0xabc", true));
         assert!(state.windows()[0].floating);
 
-        state.update_floating("0xabc", false);
+        assert!(state.update_floating("0xabc", false));
         assert!(!state.windows()[0].floating);
     }
 

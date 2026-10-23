@@ -1,5 +1,10 @@
 pub mod daemon;
 pub mod layout;
+pub mod notify;
+pub mod quote;
 pub mod restore;
+mod scheduler;
 pub mod snapshot;
+pub mod stamp;
 pub mod state;
+mod store;

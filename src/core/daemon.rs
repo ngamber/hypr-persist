@@ -1,20 +1,28 @@
 use anyhow::{Context, Result};
 use signal_hook::consts::{SIGINT, SIGTERM, SIGUSR1};
 use signal_hook_tokio::Signals;
+use std::collections::HashSet;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, mpsc};
 
 use crate::config::Config;
-use crate::core::restore::RestoreEngine;
+use crate::core::restore::{RestoreEngine, partition_windows};
+use crate::core::scheduler::{
+    Delta, SaveHistory, SaveReason, SettleState, Tick, WindowStamp, classify, on_tick,
+};
 use crate::core::snapshot::SnapshotEngine;
-use crate::core::state::StateManager;
+use crate::core::stamp::{AutoRestore, AutoRestoreInput, InstanceKey, decide_auto_restore};
+use crate::core::state::{StateManager, normalize_address};
+use crate::core::store::{FileLock, PrivateDir};
 use crate::ipc::client::HyprCtl;
 use crate::ipc::event_listener;
-use crate::models::HyprEvent;
+use crate::models::{HyprClient, HyprEvent, TrackedWindow};
 use crate::resolver::AppResolver;
 
 pub async fn run(config: Config) -> Result<()> {
+    let _instance_lock = lock_instance()?;
     let ctl = Arc::new(HyprCtl::from_env()?);
     let resolver = Arc::new(AppResolver::new(&config));
     let state = Arc::new(Mutex::new(StateManager::new(&config)));
@@ -30,37 +38,20 @@ pub async fn run(config: Config) -> Result<()> {
 
     populate_initial_state(&state, &resolver, &ctl).await?;
 
-    if config.general.restore_on_start && snapshot.exists("last") {
-        tracing::info!("waiting for compositor to settle...");
-        wait_for_settle(&mut event_rx).await;
-        tracing::info!("restoring previous session...");
-        match snapshot.load("last") {
-            Ok(session) => {
-                let live_windows: Vec<crate::models::TrackedWindow> =
-                    state.lock().await.windows().into_iter().cloned().collect();
-                let engine = RestoreEngine::new(
-                    config.general.restore_geometry,
-                    config.general.restore_layout,
-                );
-                let (report, _watcher) = engine.restore(&session, &ctl, live_windows).await?;
-                if report.failed > 0 {
-                    for (app, err) in &report.errors {
-                        tracing::warn!("restore failed for {app}: {err}");
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::warn!("failed to load session 'last': {e}");
-            }
-        }
-    }
+    maybe_auto_restore(&config, &snapshot, &state, &resolver, &ctl, &mut event_rx).await?;
 
     let mut signals =
         Signals::new([SIGINT, SIGTERM, SIGUSR1]).context("registering signal handlers")?;
 
     let save_interval = Duration::from_secs(config.general.save_interval);
-    let mut save_timer = tokio::time::interval(save_interval);
-    save_timer.tick().await;
+    let mut settle = SettleState {
+        delay: Duration::from_secs(config.general.settle_delay),
+        deadline: None,
+    };
+    let startup_saved_count = startup_saved_count(&snapshot);
+    let mut history =
+        SaveHistory::new(current_stamps(&state, &snapshot).await, startup_saved_count);
+    let mut next_wake = std::time::Instant::now() + save_interval;
 
     tracing::info!(
         "daemon running, tracking {} windows, saving every {}s",
@@ -70,34 +61,58 @@ pub async fn run(config: Config) -> Result<()> {
 
     loop {
         tokio::select! {
-            Some(event) = event_rx.recv() => {
-                handle_event(event, &state, &resolver, &ctl).await;
-            }
-
-            _ = save_timer.tick() => {
-                save_with_refresh(&state, &snapshot, &ctl, "periodic").await;
-            }
-
-            Some(sig) = futures::StreamExt::next(&mut signals) => {
-                match sig {
-                    SIGTERM | SIGINT => {
-                        tracing::info!("received signal {sig}, saving and exiting...");
-                        save_with_refresh(&state, &snapshot, &ctl, "final").await;
-                        break;
-                    }
-                    SIGUSR1 => {
-                        tracing::info!("received SIGUSR1, saving session...");
-                        save_with_refresh(&state, &snapshot, &ctl, "manual").await;
-                    }
-                    _ => {}
+            event = event_rx.recv() => {
+                let Some(event) = event else {
+                    tracing::info!("event stream ended, saving final session...");
+                    let saved = save_for_signal(
+                        &state, &snapshot, &resolver, &ctl, &mut history, &mut settle, SaveReason::Shutdown,
+                    ).await;
+                    tracing::debug!("final save wrote={saved}");
+                    break;
+                };
+                let changed = handle_event(event, &state, &resolver, &ctl).await;
+                if changed {
+                    next_wake = periodic_wake(
+                        &state,
+                        &snapshot,
+                        &resolver,
+                        &ctl,
+                        &mut history,
+                        &mut settle,
+                        save_interval,
+                    ).await;
                 }
             }
 
-            else => {
-                tracing::info!("event stream ended, saving final session...");
-                save_with_refresh(&state, &snapshot, &ctl, "final").await;
-                break;
+            () = tokio::time::sleep_until(tokio::time::Instant::from_std(next_wake)) => {
+                next_wake = periodic_wake(
+                    &state,
+                    &snapshot,
+                    &resolver,
+                    &ctl,
+                    &mut history,
+                    &mut settle,
+                    save_interval,
+                )
+                .await;
             }
+
+            Some(sig) = futures::StreamExt::next(&mut signals) => {
+                let exiting = matches!(sig, SIGTERM | SIGINT);
+                if exiting {
+                    tracing::info!("received signal {sig}, saving and exiting...");
+                } else if sig == SIGUSR1 {
+                    tracing::info!("received SIGUSR1, saving session...");
+                }
+                let reason = if exiting { SaveReason::Shutdown } else { SaveReason::Explicit };
+                if save_for_signal(&state, &snapshot, &resolver, &ctl, &mut history, &mut settle, reason).await {
+                    next_wake = std::time::Instant::now() + save_interval;
+                }
+                if exiting {
+                    break;
+                }
+            }
+
         }
     }
 
@@ -106,28 +121,364 @@ pub async fn run(config: Config) -> Result<()> {
     Ok(())
 }
 
+fn lock_instance() -> Result<FileLock> {
+    let signature = std::env::var("HYPRLAND_INSTANCE_SIGNATURE")
+        .context("HYPRLAND_INSTANCE_SIGNATURE not set, is Hyprland running?")?;
+    let instance = InstanceKey::parse(&signature)
+        .map_err(|()| anyhow::anyhow!("invalid HYPRLAND_INSTANCE_SIGNATURE"))?;
+    let runtime = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/run/user/1000".into());
+    let dir = PrivateDir::open(&PathBuf::from(runtime).join("hypr-persist"), false)?;
+    dir.try_lock(&format!(".{}.lock", instance.as_str()))?
+        .with_context(|| format!("daemon already running for Hyprland instance '{signature}'"))
+}
+
+fn startup_saved_count(snapshot: &SnapshotEngine) -> Option<usize> {
+    let target = match snapshot.save_target(None) {
+        Ok(target) => target,
+        Err(err) => {
+            tracing::warn!("failed to resolve startup save target: {err:#}");
+            return None;
+        }
+    };
+    if !snapshot.exists(&target) {
+        return None;
+    }
+    match snapshot.load(&target) {
+        Ok(session) => Some(session.windows.len()),
+        Err(err) => {
+            tracing::warn!("failed to load startup save target '{target}': {err}");
+            None
+        }
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+async fn maybe_auto_restore(
+    config: &Config,
+    snapshot: &SnapshotEngine,
+    state: &Arc<Mutex<StateManager>>,
+    resolver: &Arc<AppResolver>,
+    ctl: &HyprCtl,
+    event_rx: &mut mpsc::Receiver<HyprEvent>,
+) -> Result<()> {
+    let preexisting = if config.general.restore_on_start {
+        let clients = ctl
+            .get_clients()
+            .await
+            .context("checking preexisting windows")?;
+        let state = state.lock().await;
+        clients
+            .iter()
+            .filter(|client| state.should_track(&client.class))
+            .count()
+    } else {
+        0
+    };
+    let loaded = if config.general.restore_on_start {
+        match snapshot.resolve_restore_target(None) {
+            Ok(name) => match snapshot.load(&name) {
+                Ok(session) => Some((name, session)),
+                Err(err) => {
+                    tracing::warn!("failed to load restore target: {err}");
+                    None
+                }
+            },
+            Err(err) => {
+                tracing::debug!("no restore target: {err}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from);
+    let signature = std::env::var("HYPRLAND_INSTANCE_SIGNATURE").ok();
+    let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .ok()
+        .map(|text| text.trim().to_string());
+    let decision = decide_auto_restore(&AutoRestoreInput {
+        restore_on_start: config.general.restore_on_start,
+        state_root: &config.state_root(),
+        runtime_dir: runtime.as_deref(),
+        signature: signature.as_deref(),
+        boot_id: boot_id.as_deref(),
+        preexisting_windows: preexisting,
+        max_preexisting_windows: config.general.max_preexisting_windows,
+        target: loaded
+            .as_ref()
+            .map(|(name, session)| (name.as_str(), session)),
+    });
+    let AutoRestore::Schedule(plan) = decision else {
+        let AutoRestore::Skip(reason) = decision else {
+            return Ok(());
+        };
+        tracing::info!("auto-restore skipped: {reason:?}");
+        return Ok(());
+    };
+    let (windows, skipped) = partition_windows(&plan.session);
+    if windows.is_empty() {
+        for (app_id, err) in skipped {
+            tracing::warn!(
+                app_id = ?app_id,
+                reason = ?err.to_string(),
+                "skipping invalid saved window"
+            );
+        }
+        tracing::warn!("auto-restore skipped, no valid saved windows");
+        crate::core::notify::notify_outcome(
+            config.general.notify,
+            false,
+            &format!("session '{}': no valid windows were restored", plan.name),
+        );
+        return Ok(());
+    }
+    if let Err(reason) = plan.burn() {
+        tracing::warn!("auto-restore skipped: {reason:?}");
+        return Ok(());
+    }
+    tracing::info!(
+        "stamped instance {} at {}",
+        plan.instance.as_str(),
+        plan.stamp_path().display()
+    );
+    tracing::info!("waiting for compositor to settle...");
+    wait_for_settle(event_rx).await;
+    tracing::info!("restoring session '{}'...", plan.name);
+    let live_windows: Vec<crate::models::TrackedWindow> =
+        state.lock().await.windows().into_iter().cloned().collect();
+    let engine = RestoreEngine::new(
+        config.general.restore_geometry,
+        config.general.restore_layout,
+    );
+    let (report, _watcher) = match engine.restore(&plan.session, ctl, live_windows).await {
+        Ok(result) => result,
+        Err(err) => {
+            crate::core::notify::notify_outcome(config.general.notify, false, &err.to_string());
+            return Err(err);
+        }
+    };
+    populate_initial_state(state, resolver, ctl)
+        .await
+        .context("reconciling live state after auto-restore")?;
+    if report.failed > 0 {
+        for (app, err) in &report.errors {
+            tracing::warn!("restore failed for {app:?}: {err:?}");
+        }
+    }
+    crate::core::notify::notify_outcome(
+        config.general.notify,
+        report.failed == 0,
+        &format!("session '{}'", plan.name),
+    );
+    Ok(())
+}
+
+async fn periodic_wake(
+    state: &Arc<Mutex<StateManager>>,
+    snapshot: &SnapshotEngine,
+    resolver: &AppResolver,
+    ctl: &HyprCtl,
+    history: &mut SaveHistory,
+    settle: &mut SettleState,
+    period: Duration,
+) -> std::time::Instant {
+    {
+        let mut state = state.lock().await;
+        if state.has_pending_opens()
+            && let Err(err) = refresh_state(&mut state, resolver, ctl).await
+        {
+            tracing::warn!("failed to refresh pending opens: {err}");
+            return std::time::Instant::now() + period;
+        }
+    }
+    let stamps = current_stamps(state, snapshot).await;
+    let mut delta = classify(history.observed.as_deref(), &stamps);
+    // Disk snapshots have no live addresses; defer a smaller startup capture once.
+    if history.startup_would_shrink(stamps.len()) {
+        delta = if settle.deadline.is_none() || delta == Delta::VanishOnly {
+            Delta::VanishOnly
+        } else {
+            Delta::Unchanged
+        };
+    }
+    let tick = on_tick(
+        delta,
+        SaveReason::Periodic,
+        settle,
+        std::time::Instant::now(),
+        stamps.len(),
+    );
+    match tick {
+        Tick::Wait(deadline) => {
+            tracing::debug!("deferring reduced session capture until {deadline:?}");
+            history.observed = Some(stamps);
+            deadline
+        }
+        Tick::Save => {
+            save_with_refresh(
+                state,
+                snapshot,
+                resolver,
+                ctl,
+                history,
+                SaveReason::Periodic,
+                "periodic",
+            )
+            .await;
+            std::time::Instant::now() + period
+        }
+        Tick::Idle => {
+            history.observed = Some(stamps);
+            std::time::Instant::now() + period
+        }
+    }
+}
+
+async fn save_for_signal(
+    state: &Arc<Mutex<StateManager>>,
+    snapshot: &SnapshotEngine,
+    resolver: &AppResolver,
+    ctl: &HyprCtl,
+    history: &mut SaveHistory,
+    settle: &mut SettleState,
+    reason: SaveReason,
+) -> bool {
+    let saved = save_with_refresh(state, snapshot, resolver, ctl, history, reason, "signal").await;
+    if saved {
+        settle.deadline = None;
+    }
+    saved
+}
+
+async fn current_stamps(
+    state: &Arc<Mutex<StateManager>>,
+    snapshot: &SnapshotEngine,
+) -> Vec<WindowStamp> {
+    let state = state.lock().await;
+    snapshot
+        .capture_windows(&state)
+        .into_iter()
+        .map(|window| stamp_window(window, snapshot.per_window_launch()))
+        .collect()
+}
+
+fn stamp_window(window: &TrackedWindow, per_window_launch: bool) -> WindowStamp {
+    let address = normalize_address(&window.address);
+    let identity = if per_window_launch {
+        address.clone()
+    } else {
+        format!(
+            "{}:{}:{}:{}",
+            window.app_id.len(),
+            window.app_id,
+            window.profile.is_some(),
+            window.profile.as_deref().unwrap_or_default()
+        )
+    };
+    WindowStamp {
+        address,
+        identity,
+        workspace: window.workspace.clone(),
+        monitor: window.monitor.clone(),
+        floating: window.floating,
+        fullscreen: window.fullscreen,
+        position: window.position,
+        size: window.size,
+    }
+}
+
 /// Refresh window geometry from Hyprland and save. Hyprland emits no events
 /// for tiled resize/position changes, so we must re-query before every save
 /// to capture the user's actual layout.
 async fn save_with_refresh(
     state: &Arc<Mutex<StateManager>>,
     snapshot: &SnapshotEngine,
+    resolver: &AppResolver,
     ctl: &HyprCtl,
+    history: &mut SaveHistory,
+    reason: SaveReason,
     label: &str,
-) {
+) -> bool {
     let mut state = state.lock().await;
-    if state.window_count() == 0 {
-        return;
+    if state.window_count() == 0 && !state.has_pending_opens() {
+        return false;
     }
-    let monitor_map = ctl.get_monitor_map().await.unwrap_or_default();
-    match ctl.get_clients().await {
-        Ok(clients) => state.refresh_geometry(&clients, &monitor_map),
-        Err(e) => tracing::warn!("{label} save: failed to refresh geometry: {e}"),
+    if let Err(err) = refresh_state(&mut state, resolver, ctl).await {
+        tracing::warn!("{label} save: failed to refresh state: {err}");
+        return false;
     }
-    let save_result = snapshot.save(&state, "last");
-    drop(state);
-    if let Err(e) = save_result {
+    let stamps = snapshot
+        .capture_windows(&state)
+        .into_iter()
+        .map(|window| stamp_window(window, snapshot.per_window_launch()))
+        .collect::<Vec<_>>();
+    if stamps.is_empty() {
+        return false;
+    }
+    let target = match snapshot.save_target(None) {
+        Ok(name) => name,
+        Err(e) => {
+            tracing::error!("{label} save failed: {e}");
+            return false;
+        }
+    };
+    if reason == SaveReason::Shutdown
+        && snapshot.exists(&target)
+        && history.shutdown_would_shrink(&stamps)
+    {
+        tracing::info!("shutdown capture lost windows; preserving existing save");
+        return false;
+    }
+    if let Err(e) = snapshot.save(&state, &target) {
         tracing::error!("{label} save failed: {e}");
+        return false;
+    }
+    drop(state);
+    history.record_save(stamps);
+    true
+}
+
+async fn refresh_state(
+    state: &mut StateManager,
+    resolver: &AppResolver,
+    ctl: &HyprCtl,
+) -> Result<()> {
+    let monitor_map = ctl.get_monitor_map().await?;
+    let clients = ctl.get_clients().await?;
+    for client in &clients {
+        let Some(class) = state.pending_class(&client.address).map(str::to_owned) else {
+            continue;
+        };
+        let Some(monitor) = monitor_map.get(&client.monitor) else {
+            continue;
+        };
+        if client.size.0 <= 0 || client.size.1 <= 0 {
+            continue;
+        }
+        state.add(track_client(client, class, monitor.clone(), resolver));
+    }
+    state.refresh_geometry(&clients, &monitor_map);
+    Ok(())
+}
+
+fn track_client(
+    client: &HyprClient,
+    class: String,
+    monitor: String,
+    resolver: &AppResolver,
+) -> TrackedWindow {
+    TrackedWindow {
+        address: client.address.clone(),
+        launch_cmd: resolver.resolve(&class, client.pid).unwrap_or_default(),
+        app_id: class,
+        workspace: client.workspace.name.clone(),
+        monitor,
+        position: client.at,
+        size: client.size,
+        floating: client.floating,
+        fullscreen: client.fullscreen_mode > 0,
+        pid: client.pid,
+        profile: crate::resolver::profile::detect_browser_profile(client.pid),
     }
 }
 
@@ -145,31 +496,30 @@ async fn populate_initial_state(
     ctl: &HyprCtl,
 ) -> Result<()> {
     let clients = ctl.get_clients().await?;
-    let monitor_map = ctl.get_monitor_map().await.unwrap_or_default();
+    let monitor_map = ctl.get_monitor_map().await?;
     let mut state = state.lock().await;
+
+    let live_addresses: HashSet<_> = clients
+        .iter()
+        .map(|client| normalize_address(&client.address))
+        .collect();
+    let closed_addresses: Vec<_> = state
+        .windows()
+        .into_iter()
+        .filter(|window| !live_addresses.contains(&normalize_address(&window.address)))
+        .map(|window| window.address.clone())
+        .collect();
+    for address in closed_addresses {
+        state.remove(&address);
+    }
 
     for c in clients {
         if !state.should_track(&c.class) {
             continue;
         }
 
-        let launch_cmd = resolver.resolve(&c.class, c.pid).unwrap_or_default();
-        let profile = crate::resolver::profile::detect_browser_profile(c.pid);
         let monitor = monitor_map.get(&c.monitor).cloned().unwrap_or_default();
-
-        state.add(crate::models::TrackedWindow {
-            address: c.address,
-            app_id: c.class,
-            launch_cmd,
-            workspace: c.workspace.name,
-            monitor,
-            position: c.at,
-            size: c.size,
-            floating: c.floating,
-            fullscreen: c.fullscreen_mode > 0,
-            pid: c.pid,
-            profile,
-        });
+        state.add(track_client(&c, c.class.clone(), monitor, resolver));
     }
 
     let count = state.window_count();
@@ -183,7 +533,7 @@ async fn handle_event(
     state: &Arc<Mutex<StateManager>>,
     resolver: &Arc<AppResolver>,
     ctl: &HyprCtl,
-) {
+) -> bool {
     match event {
         HyprEvent::OpenWindow {
             address,
@@ -197,50 +547,391 @@ async fn handle_event(
             };
 
             if !should_track {
-                return;
+                return false;
             }
+            state.lock().await.defer_open(&address, class.clone());
 
-            let (pid, position, size, floating, fullscreen) =
-                match ctl.get_client_by_address(&address).await {
-                    Ok(Some(c)) => (c.pid, c.at, c.size, c.floating, c.fullscreen_mode > 0),
-                    _ => (-1, (0, 0), (0, 0), false, false),
-                };
-
-            let launch_cmd = resolver.resolve(&class, pid).unwrap_or_default();
-            let profile = crate::resolver::profile::detect_browser_profile(pid);
-
-            let mut state = state.lock().await;
-            state.add(crate::models::TrackedWindow {
-                address,
-                app_id: class,
-                launch_cmd,
-                workspace,
-                monitor: String::new(),
-                position,
-                size,
-                floating,
-                fullscreen,
-                pid,
-                profile,
-            });
+            let client = match ctl.get_client_by_address(&address).await {
+                Ok(Some(client)) => client,
+                Ok(None) => return false,
+                Err(err) => {
+                    tracing::warn!("failed to query opened window {address}: {err}");
+                    return false;
+                }
+            };
+            if client.size.0 <= 0 || client.size.1 <= 0 {
+                return false;
+            }
+            let mut window = track_client(&client, class, String::new(), resolver);
+            window.workspace = workspace;
+            state.lock().await.add(window);
+            true
         }
         HyprEvent::CloseWindow { address } => {
             let mut state = state.lock().await;
             state.remove(&address);
+            false
         }
         HyprEvent::MoveWindow { address, workspace } => {
             let mut state = state.lock().await;
-            state.update_workspace(&address, &workspace);
+            state.update_workspace(&address, &workspace)
         }
         HyprEvent::ChangeFloatingMode { address, floating } => {
             let mut state = state.lock().await;
-            state.update_floating(&address, floating);
+            state.update_floating(&address, floating)
         }
         HyprEvent::Fullscreen { state } => {
             tracing::debug!("fullscreen toggled: {state}");
+            false
         }
         HyprEvent::Unknown(ref raw) => {
             tracing::trace!("unhandled event: {raw}");
+            false
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{handle_event, periodic_wake, save_for_signal};
+    use crate::config::Config;
+    use crate::core::scheduler::{SaveHistory, SaveReason, SettleState};
+    use crate::core::snapshot::SnapshotEngine;
+    use crate::core::state::StateManager;
+    use crate::ipc::client::{HyprCtl, HyprSocketPaths};
+    use crate::models::{HyprEvent, TrackedWindow};
+    use crate::resolver::AppResolver;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::UnixListener;
+    use tokio::sync::Mutex;
+
+    fn harness() -> (Arc<Mutex<StateManager>>, Arc<AppResolver>, HyprCtl) {
+        let config = Config::default();
+        (
+            Arc::new(Mutex::new(StateManager::new(&config))),
+            Arc::new(AppResolver::new(&config)),
+            HyprCtl::new(HyprSocketPaths::new(
+                PathBuf::from("/tmp/hypr-persist-unused.sock"),
+                PathBuf::from("/tmp/hypr-persist-unused.sock2"),
+            )),
+        )
+    }
+
+    fn tracked(address: &str, workspace: &str, floating: bool) -> TrackedWindow {
+        TrackedWindow {
+            address: address.to_string(),
+            app_id: "firefox".to_string(),
+            launch_cmd: "firefox".to_string(),
+            workspace: workspace.to_string(),
+            monitor: String::new(),
+            position: (0, 0),
+            size: (800, 600),
+            floating,
+            fullscreen: false,
+            pid: 0,
+            profile: None,
+        }
+    }
+
+    #[test]
+    fn corrupt_startup_save_has_no_saved_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot = SnapshotEngine::new_with_dir(dir.path(), true).unwrap();
+        std::fs::write(dir.path().join("last.toml"), "[broken").unwrap();
+
+        assert_eq!(super::startup_saved_count(&snapshot), None);
+    }
+
+    #[test]
+    fn stamp_identity_matches_capture_mode_and_profile_presence() {
+        let window = tracked("0x1", "1", false);
+        let mut sibling = tracked("0x2", "1", false);
+        assert_eq!(super::stamp_window(&window, true).identity, "1");
+        assert_ne!(
+            super::stamp_window(&window, true).identity,
+            super::stamp_window(&sibling, true).identity
+        );
+        assert_eq!(
+            super::stamp_window(&window, false).identity,
+            super::stamp_window(&sibling, false).identity
+        );
+        sibling.profile = Some(String::new());
+        assert_ne!(
+            super::stamp_window(&window, false).identity,
+            super::stamp_window(&sibling, false).identity
+        );
+        sibling.profile = None;
+        sibling.app_id = "other".to_string();
+        assert_ne!(
+            super::stamp_window(&window, false).identity,
+            super::stamp_window(&sibling, false).identity
+        );
+    }
+
+    struct SaveHarness {
+        _dir: tempfile::TempDir,
+        state: Arc<Mutex<StateManager>>,
+        snapshot: SnapshotEngine,
+        resolver: AppResolver,
+        ctl: HyprCtl,
+        history: SaveHistory,
+        settle: SettleState,
+        server: tokio::task::JoinHandle<()>,
+    }
+
+    impl SaveHarness {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let socket = dir.path().join("ipc");
+            let listener = UnixListener::bind(&socket).unwrap();
+            let server = tokio::spawn(async move {
+                loop {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let mut request = String::new();
+                    stream.read_to_string(&mut request).await.unwrap();
+                    let response = if request == "j/clients" {
+                        "[]"
+                    } else {
+                        r#"[{"id":0,"name":"TEST"}]"#
+                    };
+                    stream.write_all(response.as_bytes()).await.unwrap();
+                }
+            });
+            let mut state = StateManager::new(&Config::default());
+            for address in ["0x1", "0x2", "0x3", "0x4", "0x5", "0x6"] {
+                state.add(tracked(address, "1", false));
+            }
+            let history = SaveHistory::new(
+                state
+                    .windows()
+                    .into_iter()
+                    .map(|window| super::stamp_window(window, true))
+                    .collect(),
+                None,
+            );
+            Self {
+                state: Arc::new(Mutex::new(state)),
+                snapshot: SnapshotEngine::new_with_dir(&dir.path().join("sessions"), true).unwrap(),
+                resolver: AppResolver::new(&Config::default()),
+                ctl: HyprCtl::new(HyprSocketPaths::new(socket.clone(), socket)),
+                history,
+                settle: SettleState {
+                    delay: Duration::from_secs(10),
+                    deadline: None,
+                },
+                server,
+                _dir: dir,
+            }
+        }
+
+        async fn save(&mut self, reason: SaveReason) -> bool {
+            save_for_signal(
+                &self.state,
+                &self.snapshot,
+                &self.resolver,
+                &self.ctl,
+                &mut self.history,
+                &mut self.settle,
+                reason,
+            )
+            .await
+        }
+
+        async fn wake(&mut self) {
+            periodic_wake(
+                &self.state,
+                &self.snapshot,
+                &self.resolver,
+                &self.ctl,
+                &mut self.history,
+                &mut self.settle,
+                Duration::from_secs(60),
+            )
+            .await;
+        }
+
+        async fn close_to_helper(&self) {
+            let mut state = self.state.lock().await;
+            for address in ["0x2", "0x3", "0x4", "0x5", "0x6"] {
+                state.remove(address);
+            }
+        }
+
+        async fn reflow_helper(&self) {
+            let mut helper = tracked("0x1", "2", true);
+            helper.position = (400, 300);
+            helper.size = (1600, 900);
+            self.state.lock().await.add(helper);
+        }
+    }
+
+    impl Drop for SaveHarness {
+        fn drop(&mut self) {
+            self.server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_preserves_saved_capture_after_vanish_wait_and_reflow() {
+        let mut h = SaveHarness::new();
+        assert!(h.save(SaveReason::Explicit).await);
+        let path = h.snapshot.session_dir().join("last.toml");
+        let original = std::fs::read(&path).unwrap();
+        h.close_to_helper().await;
+        h.wake().await;
+        assert!(h.settle.deadline.is_some());
+        assert_eq!(h.history.observed.as_ref().unwrap().len(), 1);
+        h.reflow_helper().await;
+
+        assert!(!h.save(SaveReason::Shutdown).await);
+        assert_eq!(
+            h.snapshot.load("last").unwrap().windows.len(),
+            6,
+            "shutdown replaced the complete capture with the leftover helper"
+        );
+        assert_eq!(std::fs::read(path).unwrap(), original);
+    }
+
+    #[tokio::test]
+    async fn explicit_save_accepts_a_reduced_capture() {
+        let mut h = SaveHarness::new();
+        assert!(h.save(SaveReason::Explicit).await);
+        h.close_to_helper().await;
+        assert!(h.save(SaveReason::Explicit).await);
+        assert_eq!(h.snapshot.load("last").unwrap().windows.len(), 1);
+        assert!(h.save(SaveReason::Shutdown).await);
+    }
+
+    #[tokio::test]
+    async fn periodic_reflow_waits_then_accepts_a_settled_reduction() {
+        let mut h = SaveHarness::new();
+        assert!(h.save(SaveReason::Explicit).await);
+        h.close_to_helper().await;
+        h.reflow_helper().await;
+        h.wake().await;
+        assert!(h.settle.deadline.is_some());
+        assert_eq!(h.snapshot.load("last").unwrap().windows.len(), 6);
+        assert!(!h.save(SaveReason::Shutdown).await);
+        h.wake().await;
+        assert_eq!(h.snapshot.load("last").unwrap().windows.len(), 6);
+        h.settle.deadline = Some(std::time::Instant::now());
+        h.wake().await;
+        assert_eq!(h.snapshot.load("last").unwrap().windows.len(), 1);
+        assert!(h.save(SaveReason::Shutdown).await);
+    }
+
+    #[tokio::test]
+    async fn failed_save_does_not_advance_shutdown_baseline() {
+        let mut h = SaveHarness::new();
+        assert!(h.save(SaveReason::Explicit).await);
+        h.close_to_helper().await;
+        let path = h.snapshot.session_dir().join("last.toml");
+        let backup = h.snapshot.session_dir().join("backup");
+        std::fs::rename(&path, &backup).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(!h.save(SaveReason::Explicit).await);
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::rename(backup, path).unwrap();
+
+        assert!(!h.save(SaveReason::Shutdown).await);
+        assert_eq!(h.snapshot.load("last").unwrap().windows.len(), 6);
+    }
+
+    #[tokio::test]
+    async fn shutdown_can_write_the_first_capture() {
+        let mut h = SaveHarness::new();
+        h.close_to_helper().await;
+        assert!(h.save(SaveReason::Shutdown).await);
+        assert_eq!(h.snapshot.load("last").unwrap().windows.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn untracked_move_and_float_are_not_material() {
+        let (state, resolver, ctl) = harness();
+        assert!(
+            !handle_event(
+                HyprEvent::MoveWindow {
+                    address: "0xabc".to_string(),
+                    workspace: "2".to_string(),
+                },
+                &state,
+                &resolver,
+                &ctl,
+            )
+            .await
+        );
+        assert!(
+            !handle_event(
+                HyprEvent::ChangeFloatingMode {
+                    address: "0xabc".to_string(),
+                    floating: true,
+                },
+                &state,
+                &resolver,
+                &ctl,
+            )
+            .await
+        );
+    }
+
+    #[tokio::test]
+    async fn unchanged_tracked_move_and_float_are_not_material() {
+        let (state, resolver, ctl) = harness();
+        state.lock().await.add(tracked("0xabc", "1", false));
+
+        assert!(
+            !handle_event(
+                HyprEvent::MoveWindow {
+                    address: "abc".to_string(),
+                    workspace: "1".to_string(),
+                },
+                &state,
+                &resolver,
+                &ctl,
+            )
+            .await
+        );
+        assert!(
+            !handle_event(
+                HyprEvent::ChangeFloatingMode {
+                    address: "0xabc".to_string(),
+                    floating: false,
+                },
+                &state,
+                &resolver,
+                &ctl,
+            )
+            .await
+        );
+
+        assert!(
+            handle_event(
+                HyprEvent::MoveWindow {
+                    address: "0xabc".to_string(),
+                    workspace: "2".to_string(),
+                },
+                &state,
+                &resolver,
+                &ctl,
+            )
+            .await
+        );
+        assert!(
+            handle_event(
+                HyprEvent::ChangeFloatingMode {
+                    address: "0xabc".to_string(),
+                    floating: true,
+                },
+                &state,
+                &resolver,
+                &ctl,
+            )
+            .await
+        );
+        assert_eq!(state.lock().await.windows()[0].workspace, "2");
+        assert!(state.lock().await.windows()[0].floating);
     }
 }
